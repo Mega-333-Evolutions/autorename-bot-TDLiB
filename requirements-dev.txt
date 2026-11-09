@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=8
+pytest-asyncio>=0.23
+pyflakes
+# Optional: with Telethon installed, tests/test_tg_html_parity.py also checks that the bot reads HTML exactly as the Telethon version did.
+# telethon==1.45.0

@@ -1,0 +1,14 @@
+# TDLib is what talks to Telegram: tdjson is TDLib itself as a prebuilt library (wheels for Linux, x86_64 and aarch64),
+# Pytdbot is the Python wrapper. Both are pinned together: the wrapper's types are made for one TDLib release (Pytdbot 0.10.1: TDLib 1.8.65),
+# and it warns at every start when another one is installed.
+Pytdbot==0.10.1
+tdjson==1.8.65
+SQLAlchemy[asyncio]>=2.0.30,<3
+aiosqlite>=0.20
+asyncpg>=0.29
+aiohttp>=3.9
+psutil>=5.9
+Pillow>=10.0
+pymediainfo>=6.1
+speedtest-cli>=2.1.3
+uvloop>=0.19; sys_platform != "win32"
