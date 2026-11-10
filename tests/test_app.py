@@ -598,12 +598,13 @@ async def test_status_shows_what_makes_transfers_fast_and_how_they_went(ctx, mon
     assert "Streaming failed 1×" in text and "RuntimeError: boom" in text
 
 
-async def test_status_survives_a_failed_ping(ctx, monkeypatch):
+async def test_status_survives_a_failed_ping(ctx, monkeypatch, caplog):
     async def broken():
         raise ConnectionError("offline")
 
     monkeypatch.setattr(ctx.client, "ping", broken)
     assert "n/a" in (await say(ctx, OWNER, "/status")).texts[0]
+    assert "ping failed: ConnectionError: offline" in caplog.text  # the reason is in the Space log, not only "n/a" on screen
 
 
 async def test_stats_reports_users_files_and_system_usage(ctx):

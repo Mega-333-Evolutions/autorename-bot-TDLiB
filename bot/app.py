@@ -1432,7 +1432,7 @@ class App:
         try:
             ping_ms = await self.client.ping()
         except Exception as exc:  # noqa: BLE001
-            log.debug("ping failed: %s", exc)
+            log.warning("ping failed: %s: %s", type(exc).__name__, exc)
         await self._reply(
             event, sysinfo.format_status(ping_ms, getattr(self.client.session, "dc_id", None), sysinfo.library_version(), self._speed_text())
         )

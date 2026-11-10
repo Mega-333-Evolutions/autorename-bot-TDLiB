@@ -666,7 +666,21 @@ async def test_the_chat_of_a_message_must_be_known_to_telegram_is_checked_with_g
 
 async def test_ping_measures_a_round_trip_in_milliseconds(td, tg):
     assert 0 <= await tg.ping() < 1000
-    assert len(td.calls("testNetwork")) == 1
+    assert len(td.calls("getCommands")) == 1
+    assert request_of(td, "getCommands")["scope"] == {"@type": "botCommandScopeDefault"}
+
+
+async def test_ping_does_not_use_testnetwork_which_telegram_refuses_for_a_bot(td, tg):
+    with pytest.raises(errors.RPCError, match="BOT_METHOD_INVALID"):  # what the real thing does, and why /status showed "n/a"
+        await tg.call({"@type": "testNetwork"})
+    await tg.ping()
+    assert [r["@type"] for r in td.requests].count("testNetwork") == 1  # only the probe above
+
+
+async def test_a_failed_ping_is_not_swallowed_by_the_client(td, tg):
+    td.reply("getCommands", error(500, "Internal"))
+    with pytest.raises(errors.RPCError):
+        await tg.ping()
 
 
 async def test_start_run_and_disconnect_drive_the_tdlib_client(td, tg):

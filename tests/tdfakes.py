@@ -383,4 +383,8 @@ class FakeTd:
             return {"@type": "messages", "total_count": 0, "messages": [None] * len(request["message_ids"])}
         if kind == "downloadFile":
             return td_file(request["file_id"], 100, path="/nonexistent", completed=True)
+        if kind == "testNetwork":  # asks Telegram for the nearest data center (help.getNearestDc), which a bot may not do
+            return error(400, "BOT_METHOD_INVALID")
+        if kind == "getCommands":
+            return {"@type": "botCommands", "bot_user_id": 999, "commands": []}
         return {"@type": "ok"}

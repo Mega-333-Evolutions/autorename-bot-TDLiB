@@ -500,9 +500,11 @@ class Client:
                           "commands": [{"@type": "botCommand", "command": c.command, "description": c.description} for c in commands]})
 
     async def ping(self) -> float:
-        """Milliseconds for a round trip to Telegram."""
+        """Milliseconds for a round trip to Telegram.  TDLib's ``testNetwork`` is no use: Telegram refuses the request behind it for a
+        bot (``BOT_METHOD_INVALID``).  What is timed is a request a bot may make that TDLib never answers from its own cache: its own
+        command list."""
         started = time.perf_counter()
-        await self._call({"@type": "testNetwork"})
+        await self._call({"@type": "getCommands", "scope": {"@type": "botCommandScopeDefault"}, "language_code": ""})
         return (time.perf_counter() - started) * 1000
 
     # ------------------------------------------------------------------ files in
