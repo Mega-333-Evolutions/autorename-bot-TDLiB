@@ -677,6 +677,74 @@ async def test_ping_does_not_use_testnetwork_which_telegram_refuses_for_a_bot(td
     assert [r["@type"] for r in td.requests].count("testNetwork") == 1  # only the probe above
 
 
+async def test_a_request_goes_on_when_the_one_waiting_for_it_is_cancelled(td, tg):
+    """pytdbot's future for the answer dies with the waiter, and the answer TDLib still sends then fails there (``InvalidStateError``,
+    reported as ``Task exception was never retrieved``).  The request has to finish with nobody listening."""
+    answered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow(_request):
+        await release.wait()  # cancelled here when the waiter takes the request with it
+        answered.set()
+        return {"@type": "ok"}
+
+    td.reply("getCommands", slow)
+    waiter = asyncio.ensure_future(tg.ping())
+    await asyncio.sleep(0.01)
+    assert len(td.calls("getCommands")) == 1
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    await asyncio.wait_for(answered.wait(), 1)  # the request ran to its end
+
+
+async def test_a_request_that_fails_after_its_waiter_was_cancelled_is_not_reported_as_unretrieved(td, tg):
+    import gc
+
+    release, seen = asyncio.Event(), []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: seen.append(context))
+
+    async def failing(_request):
+        await release.wait()
+        raise ValueError("Failed to parse JSON object as TDLib request")
+
+    td.reply("getCommands", failing)
+    waiter = asyncio.ensure_future(tg.ping())
+    await asyncio.sleep(0.01)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    release.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gc.collect()
+    await asyncio.sleep(0)
+    assert seen == []  # asyncio's "Task exception was never retrieved" would be in here
+
+
+async def test_the_late_answer_to_a_cancelled_request_does_not_fail_inside_pytdbot(tmp_path):
+    """The reported traceback, with pytdbot's own client: ``process_update`` -> ``result.set_result(...)`` -> ``InvalidStateError``."""
+    from types import SimpleNamespace
+
+    from pytdbot import Client as Pytdbot
+
+    sent = []
+    real = Pytdbot(token="999:AAHexample", api_id=1, api_hash="0" * 32, database_encryption_key="key", files_directory=str(tmp_path))
+    real.client_manager = SimpleNamespace(send=lambda _client_id, request: sent.append(request))  # nothing is sent to TDLib here
+    real.client_id = 1
+    tg = Client(real, tmp_dir=tmp_path / "send")
+
+    waiter = asyncio.ensure_future(tg.ping())
+    await asyncio.sleep(0.01)
+    assert [r["@type"] for r in sent] == ["getCommands"]
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    # TDLib answers all the same
+    await real.process_update({"@type": "botCommands", "bot_user_id": 999, "commands": [], "@extra": sent[0]["@extra"]})
+    assert real._results == {}
+
+
 async def test_a_failed_ping_is_not_swallowed_by_the_client(td, tg):
     td.reply("getCommands", error(500, "Internal"))
     with pytest.raises(errors.RPCError):

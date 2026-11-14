@@ -306,6 +306,19 @@ def _stream_title(template: str, stream: Stream, position: int) -> str:
     return template.replace("{lang}", lang_label(stream, position))
 
 
+_EXT_CONTAINER = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mp4", ".mkv": "matroska", ".mka": "matroska", ".webm": "matroska"}
+
+
+def _real_container(format_name: str) -> Optional[str]:
+    """What a file really is, from ffprobe's name for it (``matroska,webm``, ``mov,mp4,m4a,3gp,3g2,mj2``)."""
+    names = set((format_name or "").split(","))
+    if names & {"matroska", "webm"}:
+        return "matroska"
+    if names & {"mov", "mp4"}:
+        return "mp4"
+    return None
+
+
 def build_plan(info: MediaInfo, settings: Dict[str, Any], ext: str) -> Optional[Plan]:
     """Work out the ffmpeg options for a file.  ``None`` means "nothing to do"."""
     if not settings.get("metadata_on"):
@@ -353,6 +366,11 @@ def build_plan(info: MediaInfo, settings: Dict[str, Any], ext: str) -> Optional[
     for s in maps:
         args += ["-map", f"0:{s.index}"]
     args += ["-c", "copy"]
+    real = _real_container(info.format_name)
+    if real and _EXT_CONTAINER.get(ext, real) != real:
+        # The name says one container and the file is another (a Matroska file called .mp4 is common).  It stays what it is, as it
+        # does when it is only renamed: ffmpeg would pick the muxer from the name, and an MP4 cannot hold SRT subtitles or fonts.
+        args += ["-f", real]
 
     for key in ("title", "author", "artist"):
         if meta.get(key):

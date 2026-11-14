@@ -45,6 +45,12 @@ def plain(value: Any) -> Any:
     return obj_to_dict(value)
 
 
+def _outcome_seen(task: "asyncio.Future[Any]") -> None:
+    """Marks the outcome of a request as seen, so that a failure nobody waited for is not logged by asyncio as an unretrieved one."""
+    if not task.cancelled():
+        task.exception()
+
+
 def file_type_of_id(remote_id: str) -> Optional[str]:
     """``photo``, ``video``, ``document`` ... for a persistent file id, ``None`` when it is not one."""
     import struct
@@ -127,10 +133,18 @@ class Client:
                 task.cancel()
 
     # ------------------------------------------------------------------ requests
+    async def _invoke(self, request: Dict[str, Any]) -> Any:
+        """``invoke`` that carries on when the one waiting for it is cancelled.  A request cannot be taken back once TDLib has it, and
+        pytdbot's future for the answer dies with the waiter: the answer then fails inside pytdbot (``InvalidStateError``) and is
+        reported as a bug of the bot.  Here the request simply finishes with nobody listening."""
+        task = asyncio.ensure_future(self._td.invoke(request))
+        task.add_done_callback(_outcome_seen)
+        return await asyncio.shield(task)
+
     async def _call(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """One TDLib request.  A flood wait that is short enough is waited out and the request repeated."""
         for attempt in range(4):
-            answer = plain(await self._td.invoke(request))
+            answer = plain(await self._invoke(request))
             if not isinstance(answer, dict) or answer.get("@type") != "error":
                 return answer if isinstance(answer, dict) else {}
             error = errors.from_td(answer.get("code") or 0, answer.get("message") or "", request.get("@type"))

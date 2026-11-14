@@ -141,6 +141,34 @@ def test_build_plan_audio_safeguard():
     assert plan.warnings
 
 
+@pytest.mark.parametrize("format_name, ext, forced", [
+    ("matroska,webm", ".mp4", "matroska"),  # a Matroska file called .mp4: it stays Matroska (an MP4 cannot hold SRT or fonts)
+    ("matroska,webm", ".m4v", "matroska"),
+    ("matroska,webm", ".mov", "matroska"),
+    ("mov,mp4,m4a,3gp,3g2,mj2", ".mkv", "mp4"),  # an MP4 called .mkv: Matroska cannot hold its subtitles
+    ("mov,mp4,m4a,3gp,3g2,mj2", ".webm", "mp4"),
+    ("matroska,webm", ".mkv", None),  # the name says what the file is: ffmpeg's own choice
+    ("matroska,webm", ".webm", None),
+    ("matroska,webm", ".mka", None),
+    ("mov,mp4,m4a,3gp,3g2,mj2", ".mp4", None),
+    ("mov,mp4,m4a,3gp,3g2,mj2", ".mov", None),
+    ("mov,mp4,m4a,3gp,3g2,mj2", ".m4v", None),
+    ("", ".mp4", None),  # not known: nothing is forced
+    ("avi", ".mp4", None),  # not a container this knows: left to ffmpeg, as before
+])
+def test_build_plan_keeps_the_container_the_file_really_is(format_name, ext, forced):
+    info = make_info()
+    info.format_name = format_name
+    plan = build_plan(info, {"metadata_on": True, "meta": {"title": "T"}}, ext)
+    assert plan is not None
+    if forced is None:
+        assert "-f" not in plan.args
+    else:
+        assert plan.args[plan.args.index("-f") + 1] == forced
+        assert plan.args.index("-f") > plan.args.index("copy")  # an output option, after the maps
+        assert plan.args.count("-f") == 1
+
+
 def test_build_plan_subtitles_dropped_when_nothing_matches():
     plan = build_plan(make_info(), {"metadata_on": True, "keep_subtitle": ["french"], "meta": {}}, ".mkv")
     assert plan.kept_subtitles == []
@@ -278,6 +306,47 @@ async def test_apply_plan_mp4(media_dir, tmp_path):
     assert [s.lang for s in out.audio] == ["eng", "jpn"]
     assert [s.kind for s in out.streams].count("subtitle") == 1
     assert out.tags.get("title") == "MP4 Title"
+
+
+@needs_ffmpeg
+async def test_apply_plan_matroska_called_mp4_stays_matroska_with_every_track(media_dir, tmp_path):
+    """The failure that was reported: ``Could not find tag for codec subrip in stream #3, codec not currently supported in container``."""
+    src = tmp_path / "Anime_Fury_S_04_EP_07_Tokyo_Revengers_1080p_Dual_Audio.mp4"
+    src.write_bytes((media_dir / "sample.mkv").read_bytes())  # Matroska inside, MP4 on the label
+    info = await probe(src)
+    assert "matroska" in info.format_name
+    plan = build_plan(info, {"metadata_on": True, "meta": {"title": "Tokyo Revengers", "audio": "{lang}", "subtitle": "{lang}"}}, ".mp4")
+    dst = tmp_path / "Tokyo Revengers S04 E07.mp4"
+    await apply_plan(src, dst, plan)
+    out = await probe(dst)
+    assert "matroska" in out.format_name  # still what it was
+    assert [(s.kind, s.codec) for s in out.streams] == [(s.kind, s.codec) for s in info.streams]  # subtitles and the font included
+    assert out.tags["title"] == "Tokyo Revengers" and [s.title for s in out.audio] == ["Japanese", "English", "Hindi"]
+
+
+@needs_ffmpeg
+async def test_apply_plan_matroska_called_mp4_with_keep_lists(media_dir, tmp_path):
+    src = tmp_path / "episode.mp4"
+    src.write_bytes((media_dir / "sample.mkv").read_bytes())
+    plan = build_plan(await probe(src), {"metadata_on": True, "keep_audio": ["english"], "keep_subtitle": ["english"], "meta": {}}, ".mp4")
+    dst = tmp_path / "out.mp4"
+    await apply_plan(src, dst, plan)
+    out = await probe(dst)
+    assert [s.lang for s in out.audio] == ["eng"] and [s.lang for s in out.subtitles] == ["eng"]
+
+
+@needs_ffmpeg
+async def test_apply_plan_mp4_called_mkv_stays_mp4(media_dir, tmp_path):
+    """The other way round: Matroska cannot hold the ``mov_text`` subtitles of an MP4, so this used to fail as well."""
+    src = tmp_path / "episode.mkv"
+    src.write_bytes((media_dir / "sample.mp4").read_bytes())
+    info = await probe(src)
+    plan = build_plan(info, {"metadata_on": True, "meta": {"title": "Kept"}}, ".mkv")
+    dst = tmp_path / "out.mkv"
+    await apply_plan(src, dst, plan)
+    out = await probe(dst)
+    assert "mp4" in out.format_name and out.tags["title"] == "Kept"
+    assert [(s.kind, s.codec) for s in out.streams] == [(s.kind, s.codec) for s in info.streams]
 
 
 @needs_ffmpeg
