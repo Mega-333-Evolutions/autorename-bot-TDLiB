@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")  # sent as a picture unless the caller says "as a file"
 _FILE_TYPE_OF_ID = {2: "photo", 3: "voice", 4: "video", 5: "document", 9: "audio", 10: "animation", 13: "video_note"}
 _KIND_CACHE = 512
+RESEND_ATTEMPTS = 3  # how many times a send that Telegram answered with a flood wait is made again
+DOWNLOAD_RETRY_DELAYS = (5.0, 15.0, 30.0)  # seconds before each new try of a download that stopped short (one try more per delay)
+_DOWNLOAD_STOPPED = "File download has failed or was canceled"  # TDLib's one answer to a download that ends before the file is complete
 
 
 def plain(value: Any) -> Any:
@@ -159,6 +162,21 @@ class Client:
         """Any TDLib request (a JSON object with its ``@type``), for the few places that need one this class has no method for."""
         return await self._call(request)
 
+    @staticmethod
+    async def _pause(seconds: float, cancel: Optional[asyncio.Event]) -> None:
+        """Wait ``seconds``; ``TransferCancelled`` when ``cancel`` is set before they are over."""
+        if cancel is None:
+            await asyncio.sleep(seconds)
+            return
+        sleeper, waiter = asyncio.ensure_future(asyncio.sleep(seconds)), asyncio.ensure_future(cancel.wait())
+        try:
+            await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            sleeper.cancel()
+            waiter.cancel()
+        if cancel.is_set():
+            raise errors.TransferCancelled()
+
     def _spawn(self, coro: Any) -> None:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
@@ -200,6 +218,7 @@ class Client:
         fut = self._sending.get(key)
         if fut is None:
             fut = asyncio.get_running_loop().create_future()
+            fut.add_done_callback(_outcome_seen)  # a failure that arrives after the waiter has left is not an "unretrieved exception"
             self._sending[key] = fut
         return fut
 
@@ -265,9 +284,19 @@ class Client:
         keyboard = markup(buttons)
         if keyboard:
             request["reply_markup"] = keyboard
-        pending = await self._call(request)
-        final = await self._await_sent(pending, progress=progress, cancel=cancel)
-        return self._seen(Message(final))
+        for attempt in range(RESEND_ATTEMPTS + 1):
+            pending = await self._call(request)
+            try:
+                final = await self._await_sent(pending, progress=progress, cancel=cancel)
+            except errors.FloodWaitError as exc:
+                # Telegram turned the message down for now (it was kept busy by the upload, say) and TDLib does not try again by itself
+                if attempt == RESEND_ATTEMPTS or exc.seconds > self.flood_sleep_threshold:
+                    raise
+                log.info("flood wait of %ss while sending: sending again", exc.seconds)
+                await self._pause(exc.seconds + 0.5, cancel)
+                continue
+            return self._seen(Message(final))
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _seen(self, message: Message) -> Message:
         """What is learnt from a message that went out: how to edit it later, and which data center the bot's files go to."""
@@ -533,7 +562,33 @@ class Client:
 
     async def _download(self, td_file: Dict[str, Any], *, progress: Optional[Callable[[int, int], None]], cancel: Optional[asyncio.Event],
                         priority: int, limit: int = 0) -> Dict[str, Any]:
-        """Ask TDLib for a file (or its first ``limit`` bytes) and wait until it is there; TDLib's description of the file after that."""
+        """Ask TDLib for a file (or its first ``limit`` bytes) and wait until it is there; TDLib's description of the file after that.
+
+        TDLib gives the same answer to every download that ends short of the file, whatever the reason (Telegram asking it to slow down
+        for longer than it will wait, a lost connection ...), and it keeps what had arrived: such a download is started again, a few times,
+        after a pause.  One that was cancelled, or that cannot be downloaded at all, is not."""
+        file_id, delays, tries = int(td_file["id"]), list(DOWNLOAD_RETRY_DELAYS), 1
+        while True:
+            try:
+                return await self._download_once(td_file, progress=progress, cancel=cancel, priority=priority, limit=limit)
+            except errors.RPCError as exc:
+                if exc.message != _DOWNLOAD_STOPPED or (cancel is not None and cancel.is_set()):
+                    raise
+                try:
+                    local = (await self._call({"@type": "getFile", "file_id": file_id})).get("local") or {}
+                except errors.RPCError:
+                    local = {}
+                if not delays or not local.get("can_be_downloaded", True):
+                    if tries > 1:
+                        raise errors.RPCError(f"{exc.message} (stopped short {tries} times)", exc.code, exc.request) from exc
+                    raise
+                log.warning("download of file %s stopped short (%s of %s bytes had arrived): trying again in %ss",
+                            file_id, local.get("downloaded_prefix_size"), td_file.get("size") or td_file.get("expected_size"), delays[0])
+                await self._pause(delays.pop(0), cancel)
+                tries += 1
+
+    async def _download_once(self, td_file: Dict[str, Any], *, progress: Optional[Callable[[int, int], None]],
+                             cancel: Optional[asyncio.Event], priority: int, limit: int = 0) -> Dict[str, Any]:
         file_id = int(td_file["id"])
         total = int(td_file.get("size") or td_file.get("expected_size") or 0)
         if progress is not None:

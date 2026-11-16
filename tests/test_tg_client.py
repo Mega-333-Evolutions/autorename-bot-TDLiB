@@ -162,6 +162,68 @@ async def test_waiting_flood_waits_out_gives_up_after_three_tries(td, tg, slept)
     assert len(td.calls("deleteMessages")) == 4 and len(slept) == 3
 
 
+FLOOD_ON_SEND = {"code": 400, "message": "Too Many Requests: retry after 8"}  # a flood wait met during the upload comes with code 400
+
+
+async def test_a_message_telegram_turns_down_for_a_flood_wait_is_sent_again_after_the_wait(td, tg, slept):
+    td.fail_sends = [dict(FLOOD_ON_SEND)]
+    sent = await tg.send_message(5, "x")
+    assert sent.id and len(td.calls("sendMessage")) == 2
+    assert [wait for wait in slept if wait] == [8.5]
+
+
+async def test_a_file_is_sent_again_after_a_flood_wait_from_the_same_place_and_the_copy_is_kept_until_then(td, tg, tmp_path, slept):
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x" * 100)
+    seen = []
+
+    def reply(request):
+        _holder, input_file = sent_file(request)
+        seen.append((input_file["path"], Path(input_file["path"]).exists()))  # it has to be there for every try
+        return td._default(request)
+
+    td.reply("sendMessage", reply)
+    td.fail_sends = [dict(FLOOD_ON_SEND)]
+    sent = await tg.send_file(5, source, caption="c", attributes=[E.DocumentAttributeFilename("n.bin")], cancel=asyncio.Event())
+    assert sent.id and len(seen) == 2 and seen[0] == seen[1] and seen[1][1]
+    assert leftovers(tg) == []  # and it is gone when the send is over
+
+
+async def test_a_send_that_keeps_meeting_flood_waits_gives_up_after_three_more_tries(td, tg, slept):
+    td.fail_sends = [{"code": 400, "message": "Too Many Requests: retry after 1"} for _ in range(6)]
+    with pytest.raises(errors.FloodWaitError) as caught:
+        await tg.send_message(5, "x")
+    assert caught.value.seconds == 1 and len(td.calls("sendMessage")) == 4 and [wait for wait in slept if wait] == [1.5, 1.5, 1.5]
+
+
+async def test_a_long_flood_wait_on_a_send_is_raised_at_once(td, tg, slept):
+    td.fail_sends = [{"code": 400, "message": "Too Many Requests: retry after 120"}]
+    with pytest.raises(errors.FloodWaitError) as caught:
+        await tg.send_message(5, "x")
+    assert caught.value.seconds == 120 and len(td.calls("sendMessage")) == 1 and [wait for wait in slept if wait] == []
+
+
+async def test_other_refusals_of_a_send_are_not_sent_again(td, tg, slept):
+    td.fail_sends = [{"code": 400, "message": "MESSAGE_TOO_LONG"}]
+    with pytest.raises(errors.MessageTooLongError):
+        await tg.send_message(5, "x")
+    assert len(td.calls("sendMessage")) == 1 and [wait for wait in slept if wait] == []
+
+
+async def test_cancelling_the_job_ends_the_wait_before_a_send_is_made_again(td, tg, tmp_path):
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x" * 100)
+    td.fail_sends = [{"code": 400, "message": "Too Many Requests: retry after 50"}]
+    cancel = asyncio.Event()
+    job = asyncio.ensure_future(tg.send_file(5, source, cancel=cancel))
+    await td.settle(30)
+    assert len(td.calls("sendMessage")) == 1 and not job.done()  # it is waiting out the 50 seconds
+    cancel.set()
+    with pytest.raises(Cancelled):
+        await asyncio.wait_for(job, 1)
+    assert len(td.calls("sendMessage")) == 1 and leftovers(tg) == []
+
+
 # ---------------------------------------------------------------------------
 # editing, deleting, reading
 # ---------------------------------------------------------------------------
@@ -563,6 +625,72 @@ async def test_a_download_that_did_not_finish_is_an_error(td, tg, tmp_path):
         await tg.download_to(incoming(), tmp_path / "src")
 
 
+STOPPED = "File download has failed or was canceled"  # TDLib's answer to every download that ends before the file is whole
+
+
+async def test_a_download_that_stops_short_is_started_again_after_a_pause(td, tg, tmp_path, slept, caplog):
+    kept = tmp_path / "td" / "file.bin"
+    kept.parent.mkdir()
+    kept.write_bytes(b"x" * 100)
+    td.reply("downloadFile", error(400, STOPPED), td_file(7, 100, path=str(kept), completed=True))
+    with caplog.at_level(logging.WARNING, logger="bot.tg.client"):
+        wrote = await tg.download_to(incoming(), tmp_path / "work" / "src.mkv")
+    assert wrote == 100 and (tmp_path / "work" / "src.mkv").read_bytes() == b"x" * 100
+    assert len(td.calls("downloadFile")) == 2 and [wait for wait in slept if wait] == [5.0]
+    assert "stopped short" in caplog.text and tg._watchers == {}
+
+
+async def test_a_download_that_keeps_stopping_short_is_given_up_after_the_last_try(td, tg, tmp_path, slept):
+    td.reply("downloadFile", error(400, STOPPED))
+    with pytest.raises(errors.RPCError) as caught:
+        await tg.download_to(incoming(), tmp_path / "src")
+    assert STOPPED in caught.value.message and "4 times" in caught.value.message and caught.value.code == 400
+    assert len(td.calls("downloadFile")) == 4 and [wait for wait in slept if wait] == [5.0, 15.0, 30.0]
+    assert tg._watchers == {}
+
+
+async def test_a_download_that_stopped_because_the_job_was_cancelled_is_not_started_again(td, tg, tmp_path, slept):
+    cancel = asyncio.Event()
+
+    def stopped(_request):
+        cancel.set()  # TDLib's answer is the same for a download that was cancelled
+        return error(400, STOPPED)
+
+    td.reply("downloadFile", stopped)
+    with pytest.raises((errors.RPCError, Cancelled)):
+        await tg.download_to(incoming(), tmp_path / "src", cancel=cancel)
+    assert len(td.calls("downloadFile")) == 1 and [wait for wait in slept if wait] == []
+
+
+async def test_a_file_that_cannot_be_downloaded_is_not_tried_again(td, tg, tmp_path, slept):
+    gone = td_file(7, 100)
+    gone["local"]["can_be_downloaded"] = False
+    td.reply("downloadFile", error(400, STOPPED))
+    td.reply("getFile", gone)
+    with pytest.raises(errors.RPCError) as caught:
+        await tg.download_to(incoming(), tmp_path / "src")
+    assert caught.value.message == STOPPED and len(td.calls("downloadFile")) == 1 and [wait for wait in slept if wait] == []
+
+
+async def test_a_download_that_fails_for_another_reason_is_not_started_again(td, tg, tmp_path, slept):
+    td.reply("downloadFile", error(400, "FILE_REFERENCE_EXPIRED"))
+    with pytest.raises(errors.RPCError):
+        await tg.download_to(incoming(), tmp_path / "src")
+    assert len(td.calls("downloadFile")) == 1 and [wait for wait in slept if wait] == []
+
+
+async def test_cancelling_the_job_ends_the_pause_before_a_new_try_of_a_download(td, tg, tmp_path):
+    td.reply("downloadFile", error(400, STOPPED))
+    cancel = asyncio.Event()
+    job = asyncio.ensure_future(tg.download_to(incoming(), tmp_path / "src", cancel=cancel))
+    await td.settle(30)
+    assert len(td.calls("downloadFile")) == 1 and not job.done()  # it is waiting out the first pause
+    cancel.set()
+    with pytest.raises(Cancelled):
+        await asyncio.wait_for(job, 1)
+    assert len(td.calls("downloadFile")) == 1 and tg._watchers == {}
+
+
 async def test_the_start_of_a_file_can_be_downloaded_alone(td, tg, tmp_path):
     kept = tmp_path / "td.bin"
     kept.write_bytes(bytes(range(100)))
@@ -743,6 +871,30 @@ async def test_the_late_answer_to_a_cancelled_request_does_not_fail_inside_pytdb
     # TDLib answers all the same
     await real.process_update({"@type": "botCommands", "bot_user_id": 999, "commands": [], "@extra": sent[0]["@extra"]})
     assert real._results == {}
+
+
+async def test_the_failure_of_a_send_nobody_waits_for_any_more_is_not_reported_as_unretrieved(td, tg, tmp_path):
+    """The streaming gave up and the job went on the usual way: Telegram's refusal of the first upload arrives when nobody waits for it."""
+    import gc
+
+    seen = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: seen.append(context))
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x" * 100)
+    td.hold_sends = True
+    cancel = asyncio.Event()
+    job = asyncio.ensure_future(tg.send_file(5, source, cancel=cancel))
+    await td.settle()
+    cancel.set()
+    with pytest.raises(Cancelled):
+        await job
+    await td.fail(None, 400, "FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tdlib/temp/23'")
+    tg._sending.clear()  # the client lets go of it, as it does when it is trimmed
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gc.collect()
+    await asyncio.sleep(0)
+    assert seen == []  # asyncio's "Future exception was never retrieved" would be in here
 
 
 async def test_a_failed_ping_is_not_swallowed_by_the_client(td, tg):

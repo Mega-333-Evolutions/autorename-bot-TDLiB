@@ -26,6 +26,7 @@ LOOK_EVERY = 2.0  # seconds between two looks at the download when TDLib has sai
 REPORT_EVERY = 0.25  # seconds between two reports of how much of the file is ready
 COPY_CHUNK = 4 * 1024 * 1024
 DOWNLOAD_PRIORITY = 16  # TDLib's scale is 1 to 32; this is what an ordinary download of the bot uses too
+MOVED_TRIES = 5  # how often a file that is not where TDLib said it was is looked for again (TDLib moves a download when it is done)
 
 
 @dataclass
@@ -189,7 +190,7 @@ class Relay:
         try:
             latest["file"] = await client.call({"@type": "downloadFile", "file_id": file_id, "priority": DOWNLOAD_PRIORITY, "offset": 0,
                                                 "limit": 0, "synchronous": False})
-            copied, reported = 0, -1
+            copied, reported, missing = 0, -1, 0
             reported_at, alive_at = 0.0, time.monotonic()
             while True:
                 if self.cancel.is_set() or (self._outer is not None and self._outer.is_set()):
@@ -205,7 +206,18 @@ class Relay:
                     total = os.path.getsize(path)
                 ready = total if done and total else int(local.get("downloaded_prefix_size") or 0)
                 if path and ready > copied:
-                    reached = await asyncio.to_thread(copy_part, path, out_fd, copied, ready)
+                    try:
+                        reached = await asyncio.to_thread(copy_part, path, out_fd, copied, ready)
+                    except FileNotFoundError:
+                        # TDLib moves a finished download out of its temporary folder to where it keeps the file, and what the bot
+                        # knows can be a moment older than that: ask where the file is now and read it from there
+                        missing += 1
+                        if missing > MOVED_TRIES:
+                            raise
+                        await asyncio.sleep(0.1 * missing)
+                        latest["file"] = await client.call({"@type": "getFile", "file_id": file_id})
+                        continue
+                    missing = 0
                     if reached > copied:
                         copied, alive_at = reached, time.monotonic()
                 done = done and copied >= total  # all of it is in the destination

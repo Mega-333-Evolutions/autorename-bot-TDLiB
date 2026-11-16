@@ -260,6 +260,63 @@ async def test_the_download_that_moves_to_its_place_when_done_is_followed(tmp_pa
     assert td.path.endswith("file.mkv") and "partial" not in td.path
 
 
+class MovedTd(StreamTd):
+    """The download is done and TDLib has moved the file to its place when the bot, which was told a moment before that it was still in
+    the temporary folder, goes to read it (``FileNotFoundError: '/tmp/tdlib/temp/23'``).  ``stale`` says how often it is told so."""
+
+    def __init__(self, *args, stale=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stale = stale
+        self.old_place = str(self.tmp / "temp" / "23")  # where it was, and no longer is
+
+    def _default(self, request):
+        if request["@type"] in ("downloadFile", "getFile"):
+            if not self.final:
+                self.arrived()
+            if self.stale > 0:
+                self.stale -= 1
+                return td_file(FILE_ID, len(self.data), remote_id="BQACAgEAAxkBAAI7", path=self.old_place, downloaded=len(self.data))
+            return self.file()
+        return super()._default(request)
+
+
+def make_moved(tmp_path, **kwargs):
+    data = os.urandom(300_000)
+    td = MovedTd(tmp_path / "td", data, **kwargs)
+    client = Client(td, tmp_dir=tmp_path / "send")
+    message = Message(td_message(document_content(NAME, len(data), file_id=FILE_ID, remote_id="BQACAgEAAxkBAAI7")))
+    return data, td, client, message
+
+
+async def test_a_download_that_is_moved_just_as_the_bot_goes_to_read_it_is_found_at_its_new_place(tmp_path):
+    data, td, client, message = make_moved(tmp_path)
+    async with transfer.Relay(client, message, NEW_NAME) as relay:
+        await send(client, relay)
+    assert td.violations == [] and relay.complete and relay.error is None and not relay.cancel.is_set()
+    assert td.progress[-1][2] == len(data)  # all of it went into the upload, from where it was after all
+    assert len(td.calls("getFile")) == 1  # one question was enough
+
+
+async def test_a_file_that_is_still_reported_in_the_old_place_for_a_moment_is_looked_for_again(tmp_path):
+    data, td, client, message = make_moved(tmp_path, stale=3)
+    async with transfer.Relay(client, message, NEW_NAME) as relay:
+        await send(client, relay)
+    assert td.violations == [] and relay.complete and relay.error is None
+    assert len(td.calls("getFile")) == 3 and td.progress[-1][2] == len(data)
+
+
+async def test_a_file_that_is_really_gone_ends_the_streaming_after_a_few_looks(tmp_path, monkeypatch):
+    monkeypatch.setattr(transfer, "MOVED_TRIES", 2)
+    data, td, client, message = make_moved(tmp_path, stale=10**6)  # it is always reported where it is not
+    async with transfer.Relay(client, message, NEW_NAME, stall_timeout=5) as relay:
+        with pytest.raises((errors.RPCError, errors.TransferCancelled)):
+            await send(client, relay)
+    assert isinstance(relay.error, FileNotFoundError) and relay.cancel.is_set() and not relay.complete
+    assert len(td.calls("getFile")) == 2  # it was looked for as often as that, and not in a loop
+    (generation,) = td.generations
+    assert td.finished[generation]["message"].startswith("FileNotFoundError")  # TDLib is told, so it lets go of the upload
+
+
 async def test_a_download_that_stops_ends_the_streaming_and_leaves_the_rest_to_the_usual_way(tmp_path):
     data, td, client, message = make(tmp_path, parts=6, delay=0.005)
     td.dies_at = len(data) // 2
