@@ -33,7 +33,7 @@ Send a file → it is downloaded, renamed, optionally tagged / trimmed, and sent
 | Speed test | `/speed`: an Ookla Speedtest from the machine the bot runs on |
 | Start banner | Owner command `/smedia`: pick an image or a GIF for `/start` right in the chat. No environment variable |
 | Queue | Files are processed **in the order you sent them** (even a forwarded batch), `/queue`, `/cancel`, live progress with speed / ETA and a Cancel button, FloodWait handling |
-| Access | Owner + admins only (`/addadmin`, `/deladmin`); everyone else is ignored (and reported to the log channel) |
+| Access | Owner, admins and guest admins (`/addadmin`, `/deladmin`, `/addgadmin`, `/delgadmin`); everyone else is ignored (and reported to the log channel) |
 | Extras | Send results to a channel (`/setchannel`), error log chat (`LOG_CHANNEL`: every error with its full traceback), `/status`, `/stats`, health endpoint for cron pings |
 | Speed | **TDLib** (a native library: it splits a file into parts and moves several at once, there is nothing to set) and `uvloop` for the bot's own code. `/status` shows what is active and how many downloads and uploads went through (see *Is it really fast?* below). **Experimental, off by default:** `STREAM_RENAME=1` uploads a big file while it is still downloading (see *Streaming renames*) |
 
@@ -109,7 +109,7 @@ If a stream fails (a connection drops for good, Telegram refuses the parts), the
 | `/speed` | Ookla Speedtest of the bot's own connection |
 | `/status` | Basic bot uptime, ping and version information |
 | `/stats` | Users, files renamed, queue, CPU, RAM, disk and network usage |
-| `/addadmin id` `/deladmin id` `/admins` `/smedia` | Owner only |
+| `/addadmin id` `/deladmin id` `/addgadmin id` `/delgadmin id` `/admins` `/smedia` | Owner only. A **guest admin** (`/addgadmin`) uses the bot like an admin, but has no **Channel** option in `/formats` and is never asked about the Database Channel after a manual rename. `/addadmin` makes a guest admin a full admin; to turn an admin into a guest admin, `/deladmin` first |
 
 Every menu setting can also be changed with the buttons: tap a field, then send the value. *Back / Home / Close* edit the same message.
 The template, caption and thumbnail have no commands and no buttons in the `/start` menu: they are edited on the screen of each format in
@@ -237,7 +237,7 @@ is **only uploaded**: no notice is written, nothing is published. Auto renames a
 3. `CHANNEL_POST_BOT_ID` is the channel post bot's id (the default is `8950016484`); only its answers in the communication chat are read.
 4. Set the same `DB_CHANNEL` and `COMMUNICATION_CHAT` in the channel post bot (see its README).
 
-Notes: the owner and the admins all get the offer. A restart while a Processing message is waiting leaves it as it was (the post, if the
+Notes: the owner and the admins all get the offer; guest admins (`/addgadmin`) never do, and have no Channel option. A restart while a Processing message is waiting leaves it as it was (the post, if the
 channel post bot publishes it, still appears). Two episodes can be in flight at once: every notice has its own `Ref`.
 
 #### Default metadata
@@ -419,7 +419,7 @@ messages show a ⚠️ line saying so (the value is left empty), so a missing nu
   button. A long traceback keeps the bot's own lines and the error and folds the library frames into one line (`[… 25 library frames …]`).
   The same error is sent once per two minutes (the next report says how many times it came back), at most 10 reports go out per
   minute, and the bot token, API hash and database password are masked first. Finished jobs are not posted there.
-* The bot only uses its own tables in the database: `users`, `admins`, `kv`, `rename_formats` and `rename_format_shares`. It can share a Postgres with other bots;
+* The bot only uses its own tables in the database: `users`, `admins`, `kv`, `rename_formats`, `rename_format_shares` and `rename_guest_admins`. It can share a Postgres with other bots;
   tables of other apps are never read or changed.
 * One-file commands (`/rename`, `/ethumb`, `/smedia`) wait 10 minutes for the file. Files that arrive together right after one are skipped with a hint instead of being auto-renamed.
 * **TDLib's state lives in the database too.** TDLib keeps its login and what it has learnt about the chats the bot is in in a small folder (`TDLIB_DIR/database`, a few tens of KB). The bot saves it to the `kv` table every 10 minutes when it changed and once more when it stops, and puts it back before TDLib starts, so a restart needs no new login. Without `DATABASE_URL` it is lost with the disk and the bot logs in again with its token; Telegram limits how often a bot may do that, so do not restart it in a loop. Half-downloaded files that a crash leaves in `TDLIB_DIR` are removed at start-up.

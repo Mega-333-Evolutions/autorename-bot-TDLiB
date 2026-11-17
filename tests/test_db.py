@@ -71,6 +71,45 @@ async def test_admins_and_kv(db):
     assert await db.kv_get("session") is None
 
 
+async def test_guest_admins_are_kept_apart_from_admins(db):
+    assert await db.add_guest_admin(20, 1) is True
+    assert await db.add_guest_admin(20, 1) is False
+    assert await db.add_guest_admin(21, 1) is True
+    assert sorted(await db.list_guest_admins()) == [20, 21] and await db.list_admins() == []  # a guest admin is no admin
+    assert await db.del_guest_admin(20) is True
+    assert await db.del_guest_admin(20) is False
+    assert await db.list_guest_admins() == [21]
+
+    assert await db.add_admin(30, 1) is True
+    assert await db.add_guest_admin(30, 1) is False and await db.list_guest_admins() == [21]  # an admin has more than that
+    assert await db.add_admin(21, 1) is True  # an admin who was a guest admin is one no more
+    assert await db.list_guest_admins() == [] and sorted(await db.list_admins()) == [21, 30]
+
+
+async def test_the_guest_admin_table_is_added_to_a_database_made_before_it_existed(tmp_path):
+    """create_all() never alters a table but creates a missing one: a database of an earlier version needs no migration."""
+    import sqlite3
+
+    path = tmp_path / "earlier.db"
+    first = Database(f"sqlite+aiosqlite:///{path}")
+    await first.init()
+    await first.add_admin(10, 1)
+    await first.close()
+    earlier = sqlite3.connect(path)
+    earlier.execute("DROP TABLE rename_guest_admins")  # what that version's database looks like
+    earlier.commit()
+    earlier.close()
+
+    database = Database(f"sqlite+aiosqlite:///{path}")
+    await database.init()
+    try:
+        assert await database.list_admins() == [10] and await database.list_guest_admins() == []
+        assert await database.add_guest_admin(20, 1) is True
+        assert await database.list_guest_admins() == [20]
+    finally:
+        await database.close()
+
+
 async def test_a_foreign_table_called_formats_in_a_shared_database_is_left_alone(tmp_path):
     """The Postgres can be shared with another app whose "formats" table has other columns (that broke /rename once)."""
     import sqlite3

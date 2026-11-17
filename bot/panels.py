@@ -228,16 +228,21 @@ def help_panel() -> Panel:
     return text, nav("home")
 
 
-def admin(owner_id: int, admins: Sequence[int], running: int, waiting: int, log_channel: Any) -> Panel:
-    shown = ", ".join(f"<code>{a}</code>" for a in list(admins)[:10]) or "none"
-    more = f" (+{len(admins) - 10} more)" if len(admins) > 10 else ""
+def _id_list(ids: Sequence[int]) -> str:
+    shown = ", ".join(f"<code>{a}</code>" for a in list(ids)[:10]) or "none"
+    return shown + (f" (+{len(ids) - 10} more)" if len(ids) > 10 else "")
+
+
+def admin(owner_id: int, admins: Sequence[int], running: int, waiting: int, log_channel: Any, guests: Sequence[int] = ()) -> Panel:
     text = (
         "<b>ADMIN</b>\n\n"
         f"<b>Owner:</b> <code>{owner_id}</code>\n"
-        f"<b>Allowed users:</b> {shown}{more}\n"
+        f"<b>Admins:</b> {_id_list(admins)}\n"
+        f"<b>Guest admins:</b> {_id_list(guests)}\n"
         f"<b>Queue:</b> {running} running · {waiting} waiting\n"
         f"<b>Log channel:</b> {('<code>%s</code>' % log_channel) if log_channel else 'not set (LOG_CHANNEL)'}\n\n"
-        "Commands: /addadmin &lt;id&gt; · /deladmin &lt;id&gt; · /admins · /smedia"
+        "Commands: /addadmin &lt;id&gt; · /deladmin &lt;id&gt; · /addgadmin &lt;id&gt; · /delgadmin &lt;id&gt; · /admins · /smedia\n"
+        "A guest admin uses the bot like an admin, without the Channel option in /formats and the Database Channel upload."
     )
     rows: List[Row] = [
         [("📊 Stats", "adm:stats"), ("🟢 Status", "adm:status")],

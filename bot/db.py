@@ -93,6 +93,20 @@ class Admin(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class GuestAdmin(Base):
+    """A guest admin: may use the bot like an admin, but has no Channel option and is never asked about the Database Channel.
+
+    A table of its own (not a column on ``admins``): create_all() creates missing tables but never alters existing ones, so a new
+    column would be missing from every database that already has that table.
+    """
+
+    __tablename__ = "rename_guest_admins"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    added_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class Format(Base):
     # Not just "formats": the Postgres may be shared with another app that already has a table of that name, and
     # create_all() leaves an existing table alone, so ours would never be created.
@@ -546,12 +560,38 @@ class Database:
             if await session.get(Admin, uid) is not None:
                 return False
             session.add(Admin(id=uid, added_by=added_by))
+            guest = await session.get(GuestAdmin, uid)
+            if guest is not None:  # an admin is no longer a guest admin
+                await session.delete(guest)
             await session.commit()
             return True
 
     async def del_admin(self, uid: int) -> bool:
         async with self._sessions() as session:
             row = await session.get(Admin, uid)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
+    # ----- guest admins ------------------------------------------------------------
+    async def list_guest_admins(self) -> List[int]:
+        async with self._sessions() as session:
+            return [int(r) for r in (await session.execute(select(GuestAdmin.id).order_by(GuestAdmin.added_at))).scalars()]
+
+    async def add_guest_admin(self, uid: int, added_by: int = 0) -> bool:
+        """``False`` when ``uid`` is a guest admin already, or an admin (who has more than a guest admin)."""
+        async with self._sessions() as session:
+            if await session.get(GuestAdmin, uid) is not None or await session.get(Admin, uid) is not None:
+                return False
+            session.add(GuestAdmin(id=uid, added_by=added_by))
+            await session.commit()
+            return True
+
+    async def del_guest_admin(self, uid: int) -> bool:
+        async with self._sessions() as session:
+            row = await session.get(GuestAdmin, uid)
             if row is None:
                 return False
             await session.delete(row)

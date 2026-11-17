@@ -19,7 +19,7 @@ from bot.queue import Job
 from bot.settings_ops import parse_format_channel
 from bot.tg import errors, types
 
-from .appkit import ADMIN_CFG, OWNER, STRANGER, click, data_of, env_for, say
+from .appkit import ADMIN_CFG, GUEST, OWNER, STRANGER, click, data_of, env_for, say
 from .tgfakes import FakeCallback, FakeClient, FakeEvent, dispatch, document_message, flat_buttons
 
 DB = -1002000000001  # the Database Channel
@@ -72,6 +72,12 @@ def ref_of(text):
 
 def last_edit(up):
     return up.client.edited[-1][1]
+
+
+async def make_guest(up, uid=GUEST):
+    """The owner makes ``uid`` a guest admin: no Channel option, no offer to upload."""
+    await say(up, OWNER, f"/addgadmin {uid}")
+    assert up.app.is_guest(uid)
 
 
 async def post_bot_says(up, text, *, reply_to=None, sender=POST_BOT, chat=COMM):
@@ -143,7 +149,9 @@ async def test_without_both_chats_nothing_is_offered_and_the_buttons_say_so(ctx)
 
 
 async def test_with_both_chats_the_offer_is_hooked_into_the_pipeline(up):
-    assert up.app.renamer.on_delivered == up.flow.offer
+    await up.app.renamer.on_delivered(manual_job(), OWNER, SimpleNamespace(id=555))
+    (entity, text, _kw), = up.client.sent
+    assert entity == OWNER and "Upload this episode to the Database Channel?" in text
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +266,49 @@ async def test_the_channel_of_a_deleted_format_is_handled(up):
     await up.db.delete_format(OWNER, fmt["id"])
     ev = await say(up, OWNER, "-1001234567890")
     assert "no longer exists" in ev.texts[0] and OWNER not in up.app.pending
+
+
+async def test_a_guest_admin_does_not_see_the_channel_option_of_a_format(up):
+    await make_guest(up)
+    mine = await up.db.create_format(GUEST, "One Piece")
+    i = mine["id"]
+    await up.db.update_format(GUEST, i, channel=SHOW)  # one it got while it was still an admin
+    assert (await say(up, GUEST, "/formats")).out  # the way to the format screen: /formats, the kind, the format
+    await click(up, GUEST, "fm:l:manual")
+    text, buttons = (await click(up, GUEST, f"fm:v:{i}")).edits[-1]
+    assert "Channel" not in text and str(SHOW) not in text
+    assert not [d for d in data_of(buttons) if "channel" in d or d.startswith("fm:chc")]
+    assert "fm:th:%d" % i in data_of(buttons) and f"fm:in:{i}:template" in data_of(buttons)  # the rest of the screen is there
+    assert (await up.db.get_format(GUEST, i))["channel"] == SHOW  # kept, for the day they are made an admin
+
+    for uid in (OWNER, ADMIN_CFG):  # the same screen of an admin, or of the owner, has it
+        theirs = await up.db.create_format(uid, "One Piece")
+        text, buttons = (await click(up, uid, f"fm:v:{theirs['id']}")).edits[-1]
+        assert "<b>Channel</b>" in text and f"fm:in:{theirs['id']}:channel" in data_of(buttons), uid
+
+    await say(up, OWNER, f"/addadmin {GUEST}")  # made an admin, they have it too
+    text, buttons = (await click(up, GUEST, f"fm:v:{i}")).edits[-1]
+    assert f"<b>Channel</b> ▸ <code>{SHOW}</code>" in text and f"fm:chc:{i}" in data_of(buttons)
+
+
+async def test_a_guest_admin_cannot_set_or_clear_a_channel_with_an_old_prompt_or_button(up):
+    await say(up, OWNER, f"/addadmin {GUEST}")  # an admin first: they open the Channel prompt
+    fmt = await up.db.create_format(GUEST, "One Piece")
+    i = fmt["id"]
+    await up.db.update_format(GUEST, i, channel=SHOW)
+    await click(up, GUEST, f"fm:in:{i}:channel", msg_id=710)
+    assert up.app.pending[GUEST].kind == "fmt:channel"
+    await say(up, OWNER, f"/deladmin {GUEST}")  # then the owner makes them a guest admin
+    await make_guest(up)
+
+    ev = await say(up, GUEST, "-1001234567890")  # what they send to the prompt that is still open
+    assert ev.texts == ["⛔ Guest admins don't have the Channel option."] and GUEST not in up.app.pending
+    assert (await up.db.get_format(GUEST, i))["channel"] == SHOW
+    cb = await click(up, GUEST, f"fm:in:{i}:channel")  # and the buttons of the screen they still have
+    assert cb.alerts == ["Guest admins don't have the Channel option."] and GUEST not in up.app.pending and not cb.edits
+    cb = await click(up, GUEST, f"fm:chc:{i}")
+    assert cb.alerts == ["Guest admins don't have the Channel option."] and not cb.edits
+    assert (await up.db.get_format(GUEST, i))["channel"] == SHOW
 
 
 async def test_the_format_screen_with_a_channel_still_fits_a_caption(up):
@@ -449,6 +500,49 @@ async def test_a_file_sent_to_the_target_channel_is_offered_with_that_channel_as
 
     await deliver(up, manual_job(), hook, target_channel=SHOW)
     assert seen == [SHOW]
+
+
+@pytest.mark.parametrize("uid", [OWNER, ADMIN_CFG])
+async def test_the_owner_and_the_admins_are_asked_after_a_manual_rename(up, uid):
+    job = manual_job(chat=uid)
+    job.user_id = uid
+    log = await deliver(up, job, up.app.renamer.on_delivered)
+    assert log == ["sent", "finished"] and job.state == "done"
+    (entity, text, kw), = up.client.sent
+    assert entity == uid and "Upload this episode to the Database Channel?" in text
+    assert [label for label, _data in flat_buttons(kw["buttons"])] == ["✅ Yes", "❌ No"]
+
+
+async def test_a_guest_admin_is_not_asked_about_the_database_channel_after_a_manual_rename(up):
+    await make_guest(up)
+    job = manual_job(chat=GUEST)
+    job.user_id = GUEST
+    log = await deliver(up, job, up.app.renamer.on_delivered)
+    assert log == ["sent", "finished"] and job.state == "done"  # the file came back, the rename is done...
+    assert up.client.sent == []  # ... and there is no Yes / No question, nor anything for the Share URL after it
+    assert not up.client.forwarded and not notices(up)
+
+    await say(up, OWNER, f"/addadmin {GUEST}")  # an admin is asked again
+    job = manual_job(chat=GUEST)
+    job.user_id = GUEST
+    await deliver(up, job, up.app.renamer.on_delivered)
+    assert len(up.client.sent) == 1 and "Upload this episode to the Database Channel?" in up.client.sent[0][1]
+
+
+async def test_a_guest_admin_cannot_use_the_upload_buttons_of_an_offer_they_were_sent_earlier(up):
+    await make_guest(up)
+    up.client.messages[555] = document_message(NAME, 10 * 1024 * 1024, mid=555)
+    buttons = [
+        f"dbu:y:{GUEST}:555:{SHOW}", f"dbu:y:{GUEST}:555:0",  # Yes
+        f"dbu:n:{GUEST}:555", "dbu:n",  # No, and the question for the Share URL after it
+        f"dbu:l:{GUEST}:555", f"dbu:g:{GUEST}:555",
+        f"dbu:d:2001:{SHOW}:7", f"dbu:dy:2001:{SHOW}:7:77",  # Delete post
+    ]
+    for data in buttons:
+        cb = await click(up, GUEST, data, msg_id=77)
+        assert cb.answers == [("Guest admins can't upload to the Database Channel.", True)], data
+        assert cb.edits == [] and not cb.deleted, data
+    assert not up.client.forwarded and not up.client.sent and not up.client.deleted and not up.app.dbflow.flows
 
 
 # ---------------------------------------------------------------------------

@@ -68,7 +68,9 @@ COMMANDS = [
     ("status", "Show basic bot uptime, ping, and version information."),
     ("stats", "Show detailed system stats such as users, CPU, RAM, and disk usage."),
 ]
-OWNER_COMMANDS = {"addadmin", "deladmin", "admins", "smedia"}
+OWNER_COMMANDS = {"addadmin", "deladmin", "addgadmin", "delgadmin", "admins", "smedia"}
+GUEST_NO_CHANNEL = "Guest admins don't have the Channel option."
+GUEST_NO_UPLOAD = "Guest admins can't upload to the Database Channel."
 BACK = {
     "remove": "rename",
     "mt_title": "meta", "mt_author": "meta", "mt_artist": "meta",
@@ -213,6 +215,7 @@ class App:
         self.cfg = cfg
         self.db = db
         self.admins: Set[int] = set(cfg.admin_ids)
+        self.guests: Set[int] = set()  # guest admins: see is_guest
         self.pending: Dict[int, Pending] = {}
         self.modes: Dict[int, Mode] = {}
         self._recent: Dict[int, List[Any]] = {}  # uid -> [command, finished_at, hint_sent] of the last one-file command
@@ -225,7 +228,7 @@ class App:
         # uploading a manually renamed episode to the Database Channel (and having it published) needs both chats
         self.dbflow: Optional[DbFlow] = DbFlow(client, cfg) if cfg.upload_enabled else None
         if self.dbflow is not None:
-            self.renamer.on_delivered = self.dbflow.offer
+            self.renamer.on_delivered = self._offer_upload
         self._warned: Set[int] = set()
         self._username: Optional[str] = None  # the bot's own @username, for the links on shared-format cards
         self._inline_on = False  # is inline mode on for the bot?  See _check_inline
@@ -236,11 +239,24 @@ class App:
         return uid is not None and uid == self.cfg.owner_id
 
     def is_allowed(self, uid: Optional[int]) -> bool:
-        return uid is not None and (uid == self.cfg.owner_id or uid in self.admins)
+        return uid is not None and (uid == self.cfg.owner_id or uid in self.admins or uid in self.guests)
+
+    def is_guest(self, uid: Optional[int]) -> bool:
+        """A guest admin uses the bot like an admin, without the Database Channel: no Channel option in /formats and no offer to
+        upload a manually renamed file.  The owner and the admins are never guests, whatever else the lists say."""
+        return uid is not None and uid in self.guests and uid != self.cfg.owner_id and uid not in self.admins
+
+    def guest_admins(self) -> List[int]:
+        return sorted(uid for uid in self.guests if self.is_guest(uid))
+
+    def _channel_option_on(self, uid: Optional[int]) -> bool:
+        """Does this user get the Channel option of a manual format (uploading to the Database Channel is set up, and they are no guest)?"""
+        return self.cfg.upload_enabled and not self.is_guest(uid)
 
     # ----------------------------------------------------------------- setup
     async def setup(self) -> None:
         self.admins |= set(await self.db.list_admins())
+        self.guests |= set(await self.db.list_guest_admins())
         self.client.parse_mode = "html"
         self._register()
         await self._set_commands()
@@ -272,6 +288,11 @@ class App:
                 await self.client.get_input_entity(ref)
             except Exception as exc:  # noqa: BLE001
                 log.warning("cannot access %s %s: %s (%s)", name, ref, exc, SEE_THE_CHAT)
+
+    async def _offer_upload(self, job: Any, target: int, sent: Any) -> None:
+        """The offer to upload a manually renamed file to the Database Channel (``DbFlow.offer``): guest admins are never asked."""
+        if self.dbflow is not None and not self.is_guest(job.user_id):
+            await self.dbflow.offer(job, target, sent)
 
     async def shutdown(self) -> None:
         for task in list(self._tasks):
@@ -387,6 +408,7 @@ class App:
             "removewords": self.cmd_remove, "setchannel": self.cmd_setchannel, "queue": self.cmd_queue,
             "cancel": self.cmd_cancel, "speed": self.cmd_speed, "status": self.cmd_status, "stats": self.cmd_stats,
             "addadmin": self.cmd_addadmin, "deladmin": self.cmd_deladmin, "admins": self.cmd_admins, "smedia": self.cmd_smedia,
+            "addgadmin": self.cmd_addgadmin, "delgadmin": self.cmd_delgadmin,
         }
         for command, kind in META_COMMANDS.items():
             table[command] = self._cmd_meta_field(command, kind)
@@ -441,7 +463,8 @@ class App:
             return panels.auto_menu(await self.db.list_formats(uid, "auto"), active["id"] if active else 0, MAX_FORMATS)
         if name == "admin":
             return panels.admin(
-                self.cfg.owner_id, sorted(self.admins), self.queue.running, self.queue.waiting, self.cfg.log_channel
+                self.cfg.owner_id, sorted(self.admins), self.queue.running, self.queue.waiting, self.cfg.log_channel,
+                guests=self.guest_admins(),
             )
         raise KeyError(name)
 
@@ -1458,8 +1481,13 @@ class App:
         if uid == self.cfg.owner_id or uid in self.admins:
             await self._reply(event, "They already have access.")
             return
-        await self.db.add_admin(uid, event.sender_id)
+        was_guest = uid in self.guests
+        await self.db.add_admin(uid, event.sender_id)  # which also ends their time as a guest admin
         self.admins.add(uid)
+        self.guests.discard(uid)
+        if was_guest:
+            await self._reply(event, f"✅ <code>{uid}</code> is now an admin, no longer a guest admin.")
+            return
         await self._reply(event, f"✅ <code>{uid}</code> can now use the bot.")
 
     async def cmd_deladmin(self, event: Any) -> None:
@@ -1468,6 +1496,9 @@ class App:
             await self._reply(event, "Usage: <code>/deladmin 123456789</code>")
             return
         uid = int(arg)
+        if self.is_guest(uid):
+            await self._reply(event, f"<code>{uid}</code> is a guest admin: use <code>/delgadmin {uid}</code> to remove them.")
+            return
         removed = await self.db.del_admin(uid)
         if uid in self.cfg.admin_ids:
             await self._reply(event, "That id is listed in the ADMIN_IDS setting; remove it there.")
@@ -1475,9 +1506,42 @@ class App:
         self.admins.discard(uid)
         await self._reply(event, f"✅ <code>{uid}</code> was removed." if removed else "That id wasn't in the list.")
 
+    async def cmd_addgadmin(self, event: Any) -> None:
+        arg = self._args(event)
+        if not re.fullmatch(r"\d{4,15}", arg):
+            await self._reply(event, "Usage: <code>/addgadmin 123456789</code> (a numeric user id; they can find theirs with @userinfobot). A guest admin uses the bot like an admin, without the Channel option and the Database Channel upload.")
+            return
+        uid = int(arg)
+        if uid == self.cfg.owner_id:
+            await self._reply(event, "That's the owner: they can do everything already.")
+            return
+        if uid in self.admins:
+            await self._reply(event, f"<code>{uid}</code> is an admin already. To make them a guest admin, remove them first with <code>/deladmin {uid}</code>.")
+            return
+        if uid in self.guests:
+            await self._reply(event, "They are a guest admin already.")
+            return
+        await self.db.add_guest_admin(uid, event.sender_id)
+        self.guests.add(uid)
+        await self._reply(event, f"✅ <code>{uid}</code> can now use the bot as a guest admin.")
+
+    async def cmd_delgadmin(self, event: Any) -> None:
+        arg = self._args(event)
+        if not re.fullmatch(r"\d{4,15}", arg):
+            await self._reply(event, "Usage: <code>/delgadmin 123456789</code>")
+            return
+        uid = int(arg)
+        if uid == self.cfg.owner_id or uid in self.admins:
+            await self._reply(event, f"<code>{uid}</code> is not a guest admin. To remove an admin, use <code>/deladmin {uid}</code>.")
+            return
+        removed = await self.db.del_guest_admin(uid)
+        self.guests.discard(uid)
+        await self._reply(event, f"✅ <code>{uid}</code> is no longer a guest admin." if removed else "That id wasn't a guest admin.")
+
     async def cmd_admins(self, event: Any) -> None:
         ids = ", ".join(f"<code>{a}</code>" for a in sorted(self.admins)) or "none"
-        await self._reply(event, f"<b>Owner:</b> <code>{self.cfg.owner_id}</code>\n<b>Allowed users:</b> {ids}")
+        guests = ", ".join(f"<code>{g}</code>" for g in self.guest_admins()) or "none"
+        await self._reply(event, f"<b>Owner:</b> <code>{self.cfg.owner_id}</code>\n<b>Admins:</b> {ids}\n<b>Guest admins:</b> {guests}")
 
     # --------------------------------------------------------------- text input
     async def on_text(self, event: Any) -> None:
@@ -1552,6 +1616,8 @@ class App:
         if head == DBFLOW_PREFIX:
             if self.dbflow is None:
                 await event.answer("Uploading to the Database Channel is switched off (DB_CHANNEL and COMMUNICATION_CHAT).", alert=True)
+            elif self.is_guest(uid):  # a button from before the owner made them a guest admin (or one made up by hand)
+                await event.answer(GUEST_NO_UPLOAD, alert=True)
             else:
                 await self.dbflow.on_callback(event, parts)
             return
@@ -1663,7 +1729,7 @@ class App:
             active = current is not None and current["id"] == fmt["id"]
         if share_inline is None:
             share_inline = await self._check_inline()
-        return panels.format_view(fmt, share_inline=share_inline, active=active, upload_on=self.cfg.upload_enabled)
+        return panels.format_view(fmt, share_inline=share_inline, active=active, upload_on=self._channel_option_on(uid))
 
     async def _show_format(self, event: Any, uid: int, fid: int, note: str = "") -> bool:
         fmt = await self.db.get_format(uid, fid)
@@ -1722,11 +1788,17 @@ class App:
             await self._show_format(event, uid, fid)
             await event.answer()
         elif action == "in" and len(parts) == 4 and parts[3] == "channel":
+            if self.is_guest(uid):
+                await event.answer(GUEST_NO_CHANNEL, alert=True)
+                return
             if fmt["kind"] != "manual" or not self.cfg.upload_enabled:
                 await event.answer("Channel is an option of manual formats, while uploading to the Database Channel is set up.", alert=True)
                 return
             await self._format_prompt(event, uid, "channel", fid)
         elif action == "chc":
+            if self.is_guest(uid):
+                await event.answer(GUEST_NO_CHANNEL, alert=True)
+                return
             await self.db.update_format(uid, fid, channel=None)
             await self._show_format(event, uid, fid)
             await event.answer("Channel cleared.")
@@ -1806,6 +1878,10 @@ class App:
     async def _on_format_text(self, event: Any, p: Pending) -> None:
         uid = event.sender_id
         field = p.kind[4:]
+        if field == "channel" and self.is_guest(uid):  # the prompt was opened before the owner made them a guest admin
+            self.pending.pop(uid, None)
+            await self._reply(event, f"⛔ {GUEST_NO_CHANNEL}")
+            return
         text = self._caption_input(event) if field == "caption" else event.raw_text or ""
         if field == "thumb":
             await self._reply(event, "Send a photo for the thumbnail, or tap Cancel.")

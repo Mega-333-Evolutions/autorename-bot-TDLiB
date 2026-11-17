@@ -1,6 +1,7 @@
 """Handler-level tests: the real event builders and handlers of the bot, with fake events and a fake client."""
 import asyncio
 import logging
+import re
 import shutil
 import time
 from pathlib import Path
@@ -16,8 +17,8 @@ from bot.queue import JobQueue
 
 from .conftest import needs_ffmpeg
 from .appkit import (
-    ADMIN_CFG, ADMIN_DB, EPISODE, EPISODE_NEW, LOG, OWNER, STRANGER, auto_thumb, autofmt, click, data_of, edit_auto, env_for, jpeg,
-    prefs, say, send_doc, set_auto_thumb,
+    ADMIN_CFG, ADMIN_DB, EPISODE, EPISODE_NEW, GUEST, LOG, OWNER, STRANGER, auto_thumb, autofmt, click, data_of, edit_auto, env_for,
+    jpeg, prefs, say, send_doc, set_auto_thumb,
 )
 from .tgfakes import (
     FakeCallback, FakeClient, FakeEvent, FakeMessage, dispatch, document_message, flat_buttons, make_file, variables_line,
@@ -58,10 +59,10 @@ async def test_group_chats_are_ignored(ctx):
 
 
 async def test_owner_only_commands_are_refused_for_admins(ctx):
-    for text in ("/addadmin 123456", "/deladmin 123456", "/admins"):
+    for text in ("/addadmin 123456", "/deladmin 123456", "/addgadmin 123456", "/delgadmin 123456", "/admins"):
         ev = await say(ctx, ADMIN_CFG, text)
         assert ev.texts == ["⛔ Only the owner can do that."], text
-    assert 123456 not in ctx.app.admins
+    assert 123456 not in ctx.app.admins and 123456 not in ctx.app.guests
     assert (await click(ctx, ADMIN_CFG, "m:admin")).alerts == ["Owner only."]
     assert (await click(ctx, ADMIN_CFG, "adm:stats")).alerts == ["Owner only."]
     assert (await click(ctx, ADMIN_CFG, "adm:clear")).alerts == ["Owner only."]
@@ -576,6 +577,94 @@ async def test_owner_manages_admins(ctx):
     assert "ADMIN_IDS" in (await say(ctx, OWNER, f"/deladmin {ADMIN_CFG}")).texts[0]
     assert ADMIN_CFG in ctx.app.admins
     assert "Usage" in (await say(ctx, OWNER, "/deladmin")).texts[0]
+
+
+async def test_owner_manages_guest_admins(ctx):
+    ev = await say(ctx, OWNER, f"/addgadmin {GUEST}")
+    assert "can now use the bot as a guest admin" in ev.texts[0]
+    assert GUEST in ctx.app.guests and GUEST not in ctx.app.admins and ctx.app.is_guest(GUEST)
+    assert await ctx.db.list_guest_admins() == [GUEST] and GUEST not in await ctx.db.list_admins()
+    assert (await say(ctx, GUEST, "/help")).out  # works immediately, like an admin's
+    assert (await say(ctx, GUEST, "/status")).out
+    assert "guest admin already" in (await say(ctx, OWNER, f"/addgadmin {GUEST}")).texts[0]
+    assert "That's the owner" in (await say(ctx, OWNER, f"/addgadmin {OWNER}")).texts[0]
+    ev = await say(ctx, OWNER, f"/addgadmin {ADMIN_CFG}")  # an admin is not turned into a guest admin by accident
+    assert "is an admin already" in ev.texts[0] and f"/deladmin {ADMIN_CFG}" in ev.texts[0]
+    assert ADMIN_CFG in ctx.app.admins and ADMIN_CFG not in ctx.app.guests and not ctx.app.is_guest(ADMIN_CFG)
+    for bad in ("/addgadmin", "/addgadmin abc", "/addgadmin 12", "/addgadmin @user"):
+        assert "Usage" in (await say(ctx, OWNER, bad)).texts[0], bad
+
+    listing = (await say(ctx, OWNER, "/admins")).texts[0]
+    assert re.search(rf"<b>Admins:</b>[^\n]*{ADMIN_CFG}", listing) and re.search(rf"<b>Guest admins:</b>[^\n]*{GUEST}", listing)
+    assert not re.search(rf"<b>Admins:</b>[^\n]*{GUEST}", listing)  # on one line only
+    panel = (await click(ctx, OWNER, "m:admin")).edits[-1][0]
+    assert re.search(rf"<b>Guest admins:</b>[^\n]*{GUEST}", panel) and "/addgadmin" in panel and "/delgadmin" in panel
+
+    assert "no longer a guest admin" in (await say(ctx, OWNER, f"/delgadmin {GUEST}")).texts[0]
+    assert GUEST not in ctx.app.guests and await ctx.db.list_guest_admins() == []
+    assert (await say(ctx, GUEST, "/help")).out == []  # access gone
+    assert "wasn't a guest admin" in (await say(ctx, OWNER, f"/delgadmin {GUEST}")).texts[0]
+    ev = await say(ctx, OWNER, f"/delgadmin {ADMIN_CFG}")  # the command for guest admins does not remove an admin
+    assert "not a guest admin" in ev.texts[0] and f"/deladmin {ADMIN_CFG}" in ev.texts[0] and ADMIN_CFG in ctx.app.admins
+    assert (await say(ctx, ADMIN_CFG, "/help")).out
+    assert "Usage" in (await say(ctx, OWNER, "/delgadmin")).texts[0]
+    assert "Guest admins:</b> none" in (await say(ctx, OWNER, "/admins")).texts[0]
+
+
+async def test_a_guest_admin_cannot_use_the_commands_that_manage_admins(ctx):
+    await say(ctx, OWNER, f"/addgadmin {GUEST}")
+    ctx.client.sent.clear()
+    attempts = [
+        "/addadmin 123456", f"/addadmin {GUEST}",  # not even to make themselves an admin
+        "/deladmin 123456", f"/deladmin {ADMIN_CFG}",
+        "/addgadmin 123456", "/delgadmin 123456", f"/delgadmin {GUEST}",
+        "/admins", "/smedia",
+    ]
+    for text in attempts:
+        ev = await say(ctx, GUEST, text)
+        assert ev.texts == ["⛔ Only the owner can do that."], text
+    assert ctx.app.admins == {ADMIN_CFG} and ctx.app.guests == {GUEST} and not ctx.app.pending
+    assert await ctx.db.list_admins() == [] and await ctx.db.list_guest_admins() == [GUEST]
+    for data in ("m:admin", "adm:stats", "adm:status", "adm:clear"):
+        assert (await click(ctx, GUEST, data)).alerts == ["Owner only."], data
+    assert ctx.client.sent == []  # nobody was reported either
+    assert "m:admin" not in data_of((await click(ctx, GUEST, "m:home")).edits[-1][1])  # the Admin button is the owner's
+
+
+async def test_addadmin_makes_a_guest_admin_an_admin_and_deladmin_points_to_delgadmin(ctx):
+    await say(ctx, OWNER, f"/addgadmin {GUEST}")
+    ev = await say(ctx, OWNER, f"/deladmin {GUEST}")
+    assert f"/delgadmin {GUEST}" in ev.texts[0]
+    assert ctx.app.guests == {GUEST} and await ctx.db.list_guest_admins() == [GUEST]  # nothing was removed
+
+    ev = await say(ctx, OWNER, f"/addadmin {GUEST}")
+    assert "is now an admin" in ev.texts[0] and "no longer a guest admin" in ev.texts[0]
+    assert GUEST in ctx.app.admins and GUEST not in ctx.app.guests and not ctx.app.is_guest(GUEST)
+    assert await ctx.db.list_admins() == [GUEST] and await ctx.db.list_guest_admins() == []
+    assert "was removed" in (await say(ctx, OWNER, f"/deladmin {GUEST}")).texts[0]
+    assert (await say(ctx, GUEST, "/help")).out == []  # and with that they are out, not back to being a guest admin
+
+
+async def test_the_owner_and_the_admins_are_never_taken_for_guest_admins(ctx):
+    ctx.app.guests |= {OWNER, ADMIN_CFG}  # what lists that disagree could say, e.g. after an id was added to ADMIN_IDS later
+    assert not ctx.app.is_guest(OWNER) and not ctx.app.is_guest(ADMIN_CFG) and ctx.app.guest_admins() == []
+    assert ctx.app.is_allowed(OWNER) and ctx.app.is_allowed(ADMIN_CFG)
+    assert "Guest admins:</b> none" in (await say(ctx, OWNER, "/admins")).texts[0]
+    assert not ctx.app.is_guest(None) and not ctx.app.is_guest(STRANGER) and not ctx.app.is_allowed(STRANGER)
+
+
+async def test_setup_loads_the_guest_admins(tmp_path):
+    cfg = load_config(env_for(tmp_path))
+    db = Database(f"sqlite+aiosqlite:///{tmp_path}/guests.db")
+    await db.init()
+    await db.add_guest_admin(GUEST, OWNER)
+    app = App(FakeClient(), cfg, db)
+    await app.setup()
+    try:
+        assert app.guests == {GUEST} and app.is_guest(GUEST) and app.is_allowed(GUEST) and app.admins == {ADMIN_CFG}
+    finally:
+        await app.shutdown()
+        await db.close()
 
 
 async def test_status_pings_telegram_and_reports_version_info(ctx):

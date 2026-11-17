@@ -11,7 +11,7 @@ from bot.db import Database
 
 from .tgfakes import FakeCallback, FakeClient, FakeEvent, dispatch, document_message, flat_buttons, telegram_text
 
-OWNER, ADMIN_CFG, ADMIN_DB, STRANGER = 1000001, 1000002, 1000003, 1999999
+OWNER, ADMIN_CFG, ADMIN_DB, GUEST, STRANGER = 1000001, 1000002, 1000003, 1000004, 1999999  # GUEST: made a guest admin by the tests that need one
 LOG = -1001111111111
 EPISODE = "[SubsPlease] Tokyo Revengers - 05 (1080p) [ABCD1234].mkv"
 EPISODE_NEW = "[S01E05] Tokyo Revengers [1080p].mkv"
