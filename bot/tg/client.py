@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")  # sent as a picture unless the caller says "as a file"
 _FILE_TYPE_OF_ID = {2: "photo", 3: "voice", 4: "video", 5: "document", 9: "audio", 10: "animation", 13: "video_note"}
 _KIND_CACHE = 512
-RESEND_ATTEMPTS = 3  # how many times a send that Telegram answered with a flood wait is made again
+FLOOD_PATIENCE = 600.0  # seconds of flood waits one send waits out in all (it is sent again after each) before the flood wait is raised
 DOWNLOAD_RETRY_DELAYS = (5.0, 15.0, 30.0)  # seconds before each new try of a download that stopped short (one try more per delay)
 _DOWNLOAD_STOPPED = "File download has failed or was canceled"  # TDLib's one answer to a download that ends before the file is complete
 
@@ -284,19 +284,22 @@ class Client:
         keyboard = markup(buttons)
         if keyboard:
             request["reply_markup"] = keyboard
-        for attempt in range(RESEND_ATTEMPTS + 1):
+        waited = 0.0
+        while True:
             pending = await self._call(request)
             try:
                 final = await self._await_sent(pending, progress=progress, cancel=cancel)
             except errors.FloodWaitError as exc:
-                # Telegram turned the message down for now (it was kept busy by the upload, say) and TDLib does not try again by itself
-                if attempt == RESEND_ATTEMPTS or exc.seconds > self.flood_sleep_threshold:
+                # Telegram turned the message down for now (it was kept busy by the upload, say) and TDLib does not try again by itself.
+                # A file goes on from where it was, so what runs out is the time spent waiting, not the number of tries
+                pause = exc.seconds + 0.5
+                if exc.seconds > self.flood_sleep_threshold or waited + pause > FLOOD_PATIENCE:
                     raise
-                log.info("flood wait of %ss while sending: sending again", exc.seconds)
-                await self._pause(exc.seconds + 0.5, cancel)
+                log.info("flood wait of %ss while sending: sending again (%ss waited so far)", exc.seconds, waited)
+                waited += pause
+                await self._pause(pause, cancel)
                 continue
             return self._seen(Message(final))
-        raise AssertionError("unreachable")  # pragma: no cover
 
     def _seen(self, message: Message) -> Message:
         """What is learnt from a message that went out: how to edit it later, and which data center the bot's files go to."""

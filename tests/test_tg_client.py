@@ -189,11 +189,58 @@ async def test_a_file_is_sent_again_after_a_flood_wait_from_the_same_place_and_t
     assert leftovers(tg) == []  # and it is gone when the send is over
 
 
-async def test_a_send_that_keeps_meeting_flood_waits_gives_up_after_three_more_tries(td, tg, slept):
-    td.fail_sends = [{"code": 400, "message": "Too Many Requests: retry after 1"} for _ in range(6)]
+async def test_a_send_that_meets_flood_waits_again_and_again_is_still_sent(td, tg, slept):
+    td.fail_sends = [dict(FLOOD_ON_SEND) for _ in range(10)]  # a busy account: "retry after 8" ten times running
+    sent = await tg.send_message(5, "x")
+    assert sent.id and len(td.calls("sendMessage")) == 11
+    assert [wait for wait in slept if wait] == [8.5] * 10
+
+
+async def test_a_file_that_meets_flood_waits_again_and_again_goes_out_from_the_same_place_every_time(td, tg, tmp_path, slept):
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x" * 100)
+    seen = []
+
+    def reply(request):
+        _holder, input_file = sent_file(request)
+        seen.append((input_file["path"], Path(input_file["path"]).exists()))
+        return td._default(request)
+
+    td.reply("sendMessage", reply)
+    td.fail_sends = [dict(FLOOD_ON_SEND) for _ in range(6)]  # job #55: "retry after 8" over and over, more often than the old three tries
+    sent = await tg.send_file(5, source, attributes=[E.DocumentAttributeFilename("n.bin")], cancel=asyncio.Event())
+    assert sent.id and len(seen) == 7 and len(set(seen)) == 1 and seen[0][1]  # one path, and the copy was there for every try
+    assert leftovers(tg) == []
+
+
+@pytest.mark.parametrize("patience", [17.0, 25.0])  # two waits of 8.5 seconds fit exactly / with a little to spare: a third would be one too many
+async def test_a_send_gives_up_when_its_flood_waits_add_up_to_more_than_the_patience(td, tg, slept, monkeypatch, patience):
+    monkeypatch.setattr("bot.tg.client.FLOOD_PATIENCE", patience)
+    td.fail_sends = [dict(FLOOD_ON_SEND) for _ in range(6)]
     with pytest.raises(errors.FloodWaitError) as caught:
         await tg.send_message(5, "x")
-    assert caught.value.seconds == 1 and len(td.calls("sendMessage")) == 4 and [wait for wait in slept if wait] == [1.5, 1.5, 1.5]
+    assert caught.value.seconds == 8 and len(td.calls("sendMessage")) == 3 and [wait for wait in slept if wait] == [8.5, 8.5]
+
+
+async def test_the_patience_is_for_one_send_and_not_for_all_of_them(td, tg, slept, monkeypatch):
+    monkeypatch.setattr("bot.tg.client.FLOOD_PATIENCE", 17.0)
+    for _ in range(3):
+        td.fail_sends = [dict(FLOOD_ON_SEND), dict(FLOOD_ON_SEND)]
+        await tg.send_message(5, "x")
+    assert len(td.calls("sendMessage")) == 9 and [wait for wait in slept if wait] == [8.5] * 6
+
+
+async def test_a_long_flood_wait_met_after_short_ones_is_raised_at_once_too(td, tg, slept):
+    td.fail_sends = [dict(FLOOD_ON_SEND), dict(FLOOD_ON_SEND), {"code": 400, "message": "Too Many Requests: retry after 120"}]
+    with pytest.raises(errors.FloodWaitError) as caught:
+        await tg.send_message(5, "x")
+    assert caught.value.seconds == 120 and len(td.calls("sendMessage")) == 3 and [wait for wait in slept if wait] == [8.5, 8.5]
+
+
+async def test_a_flood_wait_as_long_as_the_threshold_on_a_send_is_still_waited_out(td, tg, slept):
+    td.fail_sends = [{"code": 400, "message": "Too Many Requests: retry after 60"}]
+    await tg.send_message(5, "x")
+    assert len(td.calls("sendMessage")) == 2 and [wait for wait in slept if wait] == [60.5]
 
 
 async def test_a_long_flood_wait_on_a_send_is_raised_at_once(td, tg, slept):
