@@ -310,3 +310,34 @@ def test_the_format_screen_shows_its_caption_and_offers_to_reset_a_custom_one():
     assert ("↩ Reset Caption", "fm:cr:12") in [button for row in custom[1] for button in row]
     assert panels.without_inline(custom[1]) == panels.format_view(sample_format(caption="<i>{filename}</i> · {size}"), share_inline=False)[1]
     assert "caption" in panels.FORMAT_PROMPTS["caption"].lower() and "<code>reset</code>" in panels.FORMAT_PROMPTS["caption"]
+
+
+# ---------------------------------------------------------------------------
+# the question asked when the queue is empty: sort these files now?
+# ---------------------------------------------------------------------------
+
+
+def test_the_sort_question_has_yes_no_and_send_more_buttons_that_carry_the_chat_and_the_question_number():
+    text, rows = panels.sort_question(100, 4242, 7)
+    plain = visible(text)
+    assert "Do you want me to sort these 100 files now?" in plain and "queue is empty" in plain
+    assert "channel" not in plain
+    assert rows == [[("✅ Yes", "so:y:4242:7"), ("❌ No", "so:n:4242:7"), ("➕ Send more", "so:m:4242:7")]]
+    assert all(data.startswith(panels.SORT_PREFIX + ":") for _label, data in rows[0])
+
+
+def test_the_sort_question_names_the_channel_when_the_files_are_there_and_says_this_file_for_one():
+    plain = visible(panels.sort_question(3, -1001234567890123, 1, elsewhere=True)[0])
+    assert "these 3 files" in plain and "in your channel" in plain
+    assert "this file" in visible(panels.sort_question(1, 5, 1)[0]) and "1 files" not in visible(panels.sort_question(1, 5, 1)[0])
+
+
+def test_the_sort_questions_callback_data_fits_telegrams_limit_even_for_a_long_chat_id_and_number():
+    for _label, data in panels.sort_question(10 ** 6, -1009999999999999, 10 ** 9)[1][0]:
+        assert len(data.encode()) <= 64, data
+
+
+def test_the_answers_to_the_sort_question_say_what_was_decided():
+    assert "won't sort these 100 files" in panels.sort_declined(100) and "from now on" in panels.sort_declined(100)
+    assert "won't sort this file" in panels.sort_declined(1)
+    assert "100 so far" in panels.sort_waits(100) and "ask again" in panels.sort_waits(100)

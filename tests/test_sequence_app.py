@@ -96,17 +96,17 @@ async def test_the_limit_is_announced_once_and_extra_files_are_ignored(ctx, monk
     assert "3 files collected" in texts(ctx)[-1] and "most I can sort" in texts(ctx)[-1]
 
 
-async def test_a_thousand_files_can_be_collected_and_the_next_one_is_refused(ctx):
-    assert appmod.SEQUENCE_MAX == 1000
+async def test_fifteen_hundred_files_can_be_collected_and_the_next_one_is_refused(ctx):
+    assert appmod.SEQUENCE_MAX == 1500
     ev = await say(ctx, OWNER, "/sequence")
-    assert "up to 1000" in ev.texts[0]
+    assert "up to 1500" in ev.texts[0]
     replies = []
-    for k in range(1001):
+    for k in range(1501):
         replies += (await send_doc(ctx, OWNER, OP.format(n=k + 1), mid=100 + k)).texts
-    assert len(ctx.app.modes[OWNER].data.items) == 1000
-    assert len(replies) == 1 and "limit: 1000 files" in replies[0]
+    assert len(ctx.app.modes[OWNER].data.items) == 1500
+    assert len(replies) == 1 and "limit: 1500 files" in replies[0]
     await settle()
-    assert "1000 files collected" in texts(ctx)[-1] and "most I can sort at once (1000)" in texts(ctx)[-1]
+    assert "1500 files collected" in texts(ctx)[-1] and "most I can sort at once (1500)" in texts(ctx)[-1]
 
 
 async def test_every_user_has_their_own_sequence(ctx):

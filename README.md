@@ -27,7 +27,7 @@ Send a file → it is downloaded, renamed, optionally tagged / trimmed, and sent
 | Caption & thumbnail | Caption template: **format it in Telegram like any message** (bold, italic, links, …) and that formatting is kept; the default is the new name in **bold**. Custom thumbnail, automatic video-frame thumbnail otherwise. Every format has its own, and they are edited only on the format's screen in `/format` (the `/start` menu has no Template, Caption or Thumbnail buttons, and a photo you send is never made a thumbnail by itself) |
 | Metadata and tracks | **Default metadata** (`/metadata` panel): titles to write into the files, and **Keep Audio / Keep Subtitle**, which keeps only the listed tracks, in your order (stream copy, nothing is re-encoded). A format copies it with one tap: **Apply default metadata** |
 | Database Channel | Set `DB_CHANNEL` and `COMMUNICATION_CHAT` and every episode you rename with `/rename` can go on to your **Database Channel** (Yes / No): copied inside Telegram, nothing is downloaded or uploaded again. A manual format's **Channel** option then makes the **channel post bot** publish it there (see *Uploading to the Database Channel*) |
-| Episode order | `/sequence` → send files in any order → `/sort`: they come back in episode order, with the **missing** and **repeated** episodes listed |
+| Episode order | `/sequence` → send files in any order → `/sort`: they come back in episode order (season, then episode, then quality), with the **missing** and **repeated** episodes listed. After a batch of renames the bot also offers to do this by itself (**Yes / No / Send more**) |
 | Inspect | `/check` (what the bot reads from a name and caption), `/tracks`, `/mediainfo` (everything MediaInfo can read, on a **Telegraph page**), `/dc` (the data center a file is stored on) |
 | Pictures | `/ethumb` (the thumbnail of a file or video), `/size` (the dimensions of a picture) and `/resize 720 1080` (the picture at exactly that size): reply to the picture |
 | Speed test | `/speed`: an Ookla Speedtest from the machine the bot runs on |
@@ -270,18 +270,43 @@ limit of 12 of that kind still applies.
 ### `/sequence` and `/sort`
 
 ```
-/sequence          start collecting; send the files in any order (up to 1000)
+/sequence          start collecting; send the files in any order (up to 1500)
 /sort              they come back in ascending episode order
 /cancel            throw the collected files away
 ```
 
 After the last file the bot lists the **missing episodes** (per season, the gaps between the lowest and highest episode found,
-e.g. `E04, E07–E09`) and the **episode numbers that appear more than once**. Files with no readable episode number are sent at the
+e.g. `E04, E07–E09`) and the **episode numbers that appear more than once in the same quality**. Files with no readable episode number are sent at the
 end, in the order you sent them, and listed too. The episode comes from the file name, or from the caption when your `/mode` is Caption.
 `/cancel` while it is sending stops the sort.
 
+**The order.** Files are sorted by **season** first, then **episode**, then **quality**: `S01E03` and `S01E04` come before `S02E03`, even though
+the episode number repeats. The same episode in several qualities goes out smallest picture first: **480p, 720p, 1080p, 2K, 4K**
+(576p and the other heights fit in between; 2K is 1440p, 4K and UHD are 2160p). A file that does not say its quality goes after the
+others of its episode. Files that tie on all three keep the order you sent them in. Another quality of an episode is a version of it,
+so it is not listed under *Repeated episodes*; two files of the same episode **and** quality are.
+
+#### Sort after renaming
+
+You do not have to start `/sequence` for files you are renaming anyway. Once the bot has renamed your files with the auto rename
+settings and **your queue is empty**, it asks:
+
+> 🔢 **Do you want me to sort these 100 files now?**  `✅ Yes`  `❌ No`  `➕ Send more`
+
+* **Yes**: the files are sent again in the order above, followed by the missing / repeated report (the same as `/sort`).
+* **No**: that batch is dropped. Files you send afterwards are a new batch, and the next question is only about them.
+* **Send more**: the bot keeps the batch and waits. When the queue is empty again it asks once more, about **all** of the files.
+* **No button pressed** and you send more files: that counts as *Send more*. The old question is removed and one question about the
+  whole lot comes after the last file is renamed.
+
+Files you send while earlier ones are still being renamed simply join the batch (100 + 100 files → one question about 200), and the question
+only comes after the queue is empty. It waits about 4 seconds after the last file so that it does not interrupt a long upload, and it is
+only asked for two or more files. Files that failed or were cancelled are not counted, and neither are `/rename` files. If you
+renamed into a channel (`/setchannel`), the files are in the channel, so the sorted copies go there; the question says so and the report comes to
+you in the bot chat. Every user has their own queue and their own batches. The batches are kept in memory: a restart forgets them (use `/sequence` for files that are already in a chat).
+
 The first 200 files go out with only a short pause between them; after that the bot sends roughly one a second, which is about what
-Telegram allows in a single chat without making the bot wait. A full batch of 1000 therefore takes roughly 15–20 minutes. The bot
+Telegram allows in a single chat without making the bot wait. A full batch of 1500 therefore takes roughly 25–30 minutes. The bot
 looks the files up 100 at a time while it sends, so the first one arrives straight away.
 
 ### `/check`

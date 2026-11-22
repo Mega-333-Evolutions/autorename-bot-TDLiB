@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -18,6 +19,7 @@ class SeqItem:
     caption: str = ""
     season: Optional[int] = None
     episode: Optional[int] = None
+    quality: Optional[int] = None  # picture height: 480, 720, 1080, 1440 (2K), 2160 (4K)
 
 
 @dataclass
@@ -30,6 +32,17 @@ class SequenceState:
     version: int = 0  # bumped for every file, so the status task can tell whether more are still arriving
     closed: bool = False  # /sort or /cancel ended the collection
     full_noted: bool = False  # the "limit reached" notice was shown
+
+
+@dataclass
+class SortBatch:
+    """The files one user had renamed into one chat since the last answer to "sort these now?" (what /sequence collects by hand)."""
+
+    home: int  # the user's chat with the bot: the question and the report go there
+    items: List[SeqItem] = field(default_factory=list)
+    token: int = 0  # the number of the question that waits for an answer (its buttons carry it); 0: none
+    prompt_id: Optional[int] = None  # that question's message
+    version: int = 0  # bumped by whatever makes a question that is just being sent out of date
 
 
 def detect(name: str, caption: str, mode: str) -> Tuple[Optional[int], Optional[int]]:
@@ -46,12 +59,30 @@ def detect(name: str, caption: str, mode: str) -> Tuple[Optional[int], Optional[
     return None, None
 
 
+_TWO_K = re.compile(r"(?<![A-Za-z0-9])2k(?![A-Za-z0-9])", re.I)  # another name for 1440p, which the parser does not know (it knows 4K)
+
+
+def detect_quality(name: str, caption: str, mode: str) -> Optional[int]:
+    """The picture height read from the file name and the caption, the one the rename mode names first: ``1080`` for 1080p,
+    ``1440`` for 2K, ``2160`` for 4K.  ``None`` when neither says."""
+    sources = [(split_ext(name)[0], parse_info), (caption, parse_caption)]
+    if mode == "caption":
+        sources.reverse()
+    for text, read in sources:
+        quality = read(text).quality
+        if quality:
+            return int(quality[:-1])
+        if _TWO_K.search(text):
+            return 1440
+    return None
+
+
 @dataclass
 class Analysis:
-    ordered: List[SeqItem]  # numbered files by season / episode, then the others in the order they were sent
+    ordered: List[SeqItem]  # numbered files by season / episode / quality, then the others in the order they were sent
     unknown: List[SeqItem]  # no episode number found
     missing: Dict[int, List[int]]  # season -> episode numbers absent between its first and last
-    repeated: Dict[Tuple[int, int], List[SeqItem]]  # (season, episode) -> the files that share it
+    repeated: Dict[Tuple[int, int], List[SeqItem]]  # (season, episode) -> the files of it that have the same quality as another
     first: Optional[Tuple[int, int]] = None
     last: Optional[Tuple[int, int]] = None
 
@@ -59,7 +90,12 @@ class Analysis:
 def analyse(items: Sequence[SeqItem], mode: str) -> Analysis:
     for item in items:
         item.season, item.episode = detect(item.name, item.caption, mode)
-    numbered = sorted((i for i in items if i.episode is not None), key=lambda i: (i.season, i.episode, i.msg_id))
+        item.quality = detect_quality(item.name, item.caption, mode)
+    # one episode in several seasons: season 1 first; in several qualities: the smallest picture first, one without a quality last
+    numbered = sorted(
+        (i for i in items if i.episode is not None),
+        key=lambda i: (i.season, i.episode, i.quality is None, i.quality or 0, i.msg_id),
+    )
     unknown = sorted((i for i in items if i.episode is None), key=lambda i: i.msg_id)
 
     by_season: Dict[int, List[int]] = {}
@@ -73,11 +109,19 @@ def analyse(items: Sequence[SeqItem], mode: str) -> Analysis:
         gaps = [n for n in range(min(have), max(have) + 1) if n not in have]
         if gaps:
             missing[season] = gaps
+    repeated: Dict[Tuple[int, int], List[SeqItem]] = {}
+    for key, files in groups.items():
+        count: Dict[Optional[int], int] = {}
+        for f in files:
+            count[f.quality] = count.get(f.quality, 0) + 1
+        shared = [f for f in files if count[f.quality] > 1]  # the same episode in another quality is a version of it, not a repeat
+        if shared:
+            repeated[key] = shared
     return Analysis(
         ordered=numbered + unknown,
         unknown=unknown,
         missing=missing,
-        repeated={k: v for k, v in groups.items() if len(v) > 1},
+        repeated=repeated,
         first=(numbered[0].season, numbered[0].episode) if numbered else None,
         last=(numbered[-1].season, numbered[-1].episode) if numbered else None,
     )

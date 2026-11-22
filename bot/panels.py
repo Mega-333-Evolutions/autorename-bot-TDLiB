@@ -570,6 +570,32 @@ def sequence_status(count: int, limit: int) -> Panel:
     return text, [[("🔢 Sort now", "sq:sort"), ("🗑 Discard", "sq:cx")]]
 
 
+SORT_PREFIX = "so"  # callback data of the question below: so:<y|n|m>:<chat the files are in>:<number of the question>
+
+
+def sort_question(count: int, chat: int, token: int, *, elsewhere: bool = False) -> Panel:
+    """What the bot asks once its queue is empty and it has renamed files: sort them now?  ``elsewhere``: they were sent to the
+    user's channel, not to the chat with the bot."""
+    these = f"these {count} files" if count != 1 else "this file"
+    text = (
+        f"🔢 <b>Do you want me to sort {these} now?</b>\n\n"
+        "The queue is empty. I'll send them again in episode order, then list the missing and repeated episodes."
+    )
+    if elsewhere:
+        text += "\n📣 They are in your channel, so the sorted copies go there."
+    data = f"{SORT_PREFIX}:%s:{chat}:{token}"
+    return text, [[("✅ Yes", data % "y"), ("❌ No", data % "n"), ("➕ Send more", data % "m")]]
+
+
+def sort_declined(count: int) -> str:
+    these = f"these {count} files" if count != 1 else "this file"
+    return f"👍 Okay, I won't sort {these}. The next question is only about the files you send from now on."
+
+
+def sort_waits(count: int) -> str:
+    return f"➕ Okay, send me more files. I'll ask again when the queue is empty, about all of them ({count} so far)."
+
+
 # ---------------------------------------------------------------------------
 # input prompts
 # ---------------------------------------------------------------------------

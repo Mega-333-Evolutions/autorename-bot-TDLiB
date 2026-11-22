@@ -1,6 +1,6 @@
 import pytest
 
-from bot.sequence import MAX_LISTED, SeqItem, analyse, detect, format_report, ranges
+from bot.sequence import MAX_LISTED, SeqItem, analyse, detect, detect_quality, format_report, ranges
 
 
 def item(mid, name, caption=""):
@@ -38,6 +38,44 @@ def test_the_rename_mode_decides_which_source_is_read_first_and_the_other_is_the
     assert detect("random name.mkv", "One Piece - 1147", "filename") == (1, 1147)  # nothing in the name: use the caption
     assert detect("Show S01E02.mkv", "just words", "caption") == (1, 2)  # nothing in the caption: use the name
     assert detect("random.mkv", "", "caption") == (None, None)
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("Show S01E03 480p.mkv", 480),
+        ("Show S01E03 [720p].mkv", 720),
+        ("Show.S01E03.1080p.WEB.mkv", 1080),
+        ("Show S01E03 1080P.mkv", 1080),
+        ("Show S01E03 1920x1080.mkv", 1080),
+        ("Show S01E03 1440p.mkv", 1440),
+        ("Show S01E03 2K.mkv", 1440),  # 2K is 1440p
+        ("Show S01E03 2k.mkv", 1440),
+        ("Show S01E03 [2K] Dual.mkv", 1440),
+        ("Show S01E03 (2K).mkv", 1440),
+        ("Show S01E03_2K_.mkv", 1440),
+        ("Show S01E03 2160p.mkv", 2160),
+        ("Show S01E03 4K.mkv", 2160),  # 4K is 2160p
+        ("Show S01E03 UHD.mkv", 2160),
+        ("Show S01E03 2K 1080p.mkv", 1080),  # a picture height that is written out wins over the nickname
+        ("Show S01E03 12K.mkv", None),  # 2K is a word of its own, not the end of another number or name
+        ("Show S01E03 B2KX.mkv", None),
+        ("Show S01E03 x264 10bit.mkv", None),
+        ("Show S01E03.mkv", None),
+    ],
+)
+def test_detect_quality_from_the_file_name(name, expected):
+    assert detect_quality(name, "", "filename") == expected
+
+
+def test_the_quality_is_read_from_the_same_source_as_the_episode():
+    assert detect_quality("Show S01E03 480p.mkv", "Show S01E03 1080p", "filename") == 480
+    assert detect_quality("Show S01E03 480p.mkv", "Show S01E03 1080p", "caption") == 1080
+    assert detect_quality("Show S01E03.mkv", "Show S01E03 720p", "filename") == 720  # nothing in the name: use the caption
+    assert detect_quality("Show S01E03 480p.mkv", "just words", "caption") == 480  # nothing in the caption: use the name
+    assert detect_quality("Show S01E03 2K.mkv", "Show S01E03 720p", "filename") == 1440
+    assert detect_quality("Show S01E03.mkv", "Show S01E03 4K", "filename") == 2160
+    assert detect_quality("Show S01E03.mkv", "", "caption") is None
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +116,80 @@ def test_nothing_is_numbered():
     assert names(a.ordered) == ["b.mkv", "a.mkv"] and a.first is None and a.last is None and a.missing == {}
 
 
+def test_the_same_episode_number_in_two_seasons_sorts_season_one_first_then_season_two():
+    # S2E03 was sent before S1E03, and S2E03 is the smaller file name when sorted as text
+    a = analyse([item(1, "Show S02E03.mkv"), item(2, "Show S01E03.mkv"), item(3, "Show S01E04.mkv"), item(4, "Show S02E04.mkv")], "filename")
+    assert names(a.ordered) == ["Show S01E03.mkv", "Show S01E04.mkv", "Show S02E03.mkv", "Show S02E04.mkv"]
+    # the season comes before the quality: a 1080p of season 1 is still sent before a 480p of season 2
+    b = analyse([item(1, "Show S02E03 480p.mkv"), item(2, "Show S01E03 1080p.mkv")], "filename")
+    assert names(b.ordered) == ["Show S01E03 1080p.mkv", "Show S02E03 480p.mkv"]
+    assert b.repeated == {}  # S1E03 and S2E03 are different episodes
+
+
+def test_the_same_episode_in_several_qualities_sorts_480p_720p_1080p_2k_4k():
+    sent = [
+        item(1, "Show S01E03 2160p.mkv"),
+        item(2, "Show S01E03 720p.mkv"),
+        item(3, "Show S01E03 2K.mkv"),
+        item(4, "Show S01E03 480p.mkv"),
+        item(5, "Show S01E03 1080p.mkv"),
+    ]
+    assert names(analyse(sent, "filename").ordered) == [
+        "Show S01E03 480p.mkv",
+        "Show S01E03 720p.mkv",
+        "Show S01E03 1080p.mkv",
+        "Show S01E03 2K.mkv",
+        "Show S01E03 2160p.mkv",
+    ]
+    # the other names of the same pictures sort the same way
+    other = [item(1, "Show S01E03 4K.mkv"), item(2, "Show S01E03 UHD.mkv"), item(3, "Show S01E03 1440p.mkv"), item(4, "Show S01E03 576p.mkv")]
+    assert [i.quality for i in analyse(other, "filename").ordered] == [576, 1440, 2160, 2160]
+
+
+def test_the_episode_comes_before_the_quality():
+    sent = [item(1, "Show - 04 480p.mkv"), item(2, "Show - 03 2160p.mkv"), item(3, "Show - 03 480p.mkv"), item(4, "Show - 04 1080p.mkv")]
+    assert names(analyse(sent, "filename").ordered) == ["Show - 03 480p.mkv", "Show - 03 2160p.mkv", "Show - 04 480p.mkv", "Show - 04 1080p.mkv"]
+
+
+def test_a_file_without_a_quality_goes_after_the_qualities_of_its_episode_and_before_the_next_episode():
+    sent = [item(1, "Show - 04 480p.mkv"), item(2, "Show - 03.mkv"), item(3, "Show - 03 1080p.mkv"), item(4, "Show - 03 480p.mkv")]
+    assert names(analyse(sent, "filename").ordered) == ["Show - 03 480p.mkv", "Show - 03 1080p.mkv", "Show - 03.mkv", "Show - 04 480p.mkv"]
+
+
+def test_files_with_the_same_episode_and_quality_keep_the_order_they_were_sent_in():
+    sent = [item(7, "Show - 03 720p [B].mkv"), item(3, "Show - 03 720p [A].mkv"), item(9, "Show - 03 720p [C].mkv")]
+    assert names(analyse(sent, "filename").ordered) == ["Show - 03 720p [A].mkv", "Show - 03 720p [B].mkv", "Show - 03 720p [C].mkv"]
+
+
+def test_seasons_episodes_and_qualities_together():
+    sent = [
+        item(1, "Show S02E01 1080p.mkv"),
+        item(2, "Show S01E03 720p.mkv"),
+        item(3, "Show S02E01 480p.mkv"),
+        item(4, "Show S01E02 1080p.mkv"),
+        item(5, "Show S01E03 480p.mkv"),
+        item(6, "Show S01E03 2K.mkv"),
+        item(7, "Show S01E03 1080p.mkv"),
+        item(8, "Show S01E03 4K.mkv"),
+        item(9, "Show S01E03.mkv"),
+        item(10, "Show special.mkv"),
+    ]
+    a = analyse(sent, "filename")
+    assert [(i.season, i.episode, i.quality) for i in a.ordered] == [
+        (1, 2, 1080),
+        (1, 3, 480),
+        (1, 3, 720),
+        (1, 3, 1080),
+        (1, 3, 1440),
+        (1, 3, 2160),
+        (1, 3, None),
+        (2, 1, 480),
+        (2, 1, 1080),
+        (None, None, None),  # no episode number: after everything else
+    ]
+    assert a.first == (1, 2) and a.last == (2, 1) and a.missing == {}
+
+
 # ---------------------------------------------------------------------------
 # gaps and repeats
 # ---------------------------------------------------------------------------
@@ -103,6 +215,27 @@ def test_repeated_episodes_list_every_file_that_shares_the_number():
 def test_the_same_episode_number_in_different_seasons_is_not_a_repeat():
     a = analyse([item(1, "Show S01E01.mkv"), item(2, "Show S02E01.mkv")], "filename")
     assert a.repeated == {}
+
+
+def test_the_same_episode_in_another_quality_is_a_version_of_it_not_a_repeat():
+    a = analyse([item(1, "Show S01E03 480p.mkv"), item(2, "Show S01E03 720p.mkv"), item(3, "Show S01E03 1080p.mkv"), item(4, "Show S01E04 1080p.mkv")], "filename")
+    assert a.repeated == {} and a.missing == {}
+    assert a.first == (1, 3) and a.last == (1, 4)
+    # a file that does not say its quality is not a copy of one that does
+    assert analyse([item(1, "Show - 03.mkv"), item(2, "Show - 03 720p.mkv")], "filename").repeated == {}
+
+
+def test_the_same_episode_twice_in_the_same_quality_is_a_repeat_and_only_those_files_are_listed():
+    sent = [item(1, "Show - 03 720p [A].mkv"), item(2, "Show - 03 1080p.mkv"), item(3, "Show - 03 720p [B].mkv"), item(4, "Show - 03 480p.mkv")]
+    a = analyse(sent, "filename")
+    assert list(a.repeated) == [(1, 3)] and names(a.repeated[(1, 3)]) == ["Show - 03 720p [A].mkv", "Show - 03 720p [B].mkv"]
+    assert names(a.ordered) == ["Show - 03 480p.mkv", "Show - 03 720p [A].mkv", "Show - 03 720p [B].mkv", "Show - 03 1080p.mkv"]
+
+
+def test_two_names_of_the_same_quality_count_as_the_same_quality():
+    assert list(analyse([item(1, "Show - 03 4K.mkv"), item(2, "Show - 03 2160p.mkv")], "filename").repeated) == [(1, 3)]
+    assert list(analyse([item(1, "Show - 03 2K.mkv"), item(2, "Show - 03 1440p.mkv")], "filename").repeated) == [(1, 3)]
+    assert list(analyse([item(1, "Show - 03.mkv"), item(2, "Show - 03 [Dual].mkv")], "filename").repeated) == [(1, 3)]  # neither says its quality
 
 
 def test_ranges():
@@ -156,6 +289,15 @@ def test_the_report_lists_missing_repeated_and_unnumbered_files():
     assert "Repeated episodes" in text and "E02 ×2" in text and "S - 02 a.mkv" in text and "S - 02 b.mkv" in text
     assert "No episode number found" in text and "notes.mkv" in text
     assert "No missing or repeated" not in text
+
+
+def test_the_report_does_not_call_other_qualities_of_an_episode_repeats():
+    text = report(["S - 01 480p.mkv", "S - 01 720p.mkv", "S - 01 1080p.mkv", "S - 02 1080p.mkv"])
+    assert "Sorted 4 files" in text and "E01 → E02" in text and "No missing or repeated episodes." in text
+    assert "Repeated" not in text
+    # two copies of one quality are still reported, and only those two
+    text = report(["S - 01 480p.mkv", "S - 01 720p [a].mkv", "S - 01 720p [b].mkv"])
+    assert "E01 ×2" in text and "720p [a]" in text and "720p [b]" in text and "480p" not in text.split("Repeated")[1]
 
 
 def test_the_report_labels_seasons_only_when_there_are_several():

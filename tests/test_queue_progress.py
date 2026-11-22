@@ -141,6 +141,77 @@ async def test_runner_crash_does_not_kill_the_worker():
     await q.stop()
 
 
+async def test_on_left_hears_of_every_job_once_it_is_out_of_the_queue_however_it_ended():
+    left = []
+    gate = asyncio.Event()
+
+    async def runner(j):
+        if j.file_name == "boom.mkv":
+            raise RuntimeError("boom")
+        await gate.wait()
+
+    async def on_left(j):
+        left.append((j.id, j.state, j.id in q.jobs))  # it is no longer in the queue when the callback hears of it
+
+    q = JobQueue(runner, workers=1, on_left=on_left)
+    q.start()
+    a, b, c, d = job(q), job(q, name="boom.mkv"), job(q), job(q)
+    for j in (a, b, c, d):
+        q.add(j)
+    await asyncio.sleep(0.05)
+    assert q.cancel(c.id) is True  # still waiting
+    await asyncio.sleep(0.02)
+    assert left == [(c.id, "cancelled", False)]
+    gate.set()
+    await asyncio.sleep(0.1)
+    assert sorted(left) == [(a.id, "done", False), (b.id, "failed", False), (c.id, "cancelled", False), (d.id, "done", False)]
+    await q.stop()
+
+
+async def test_on_left_hears_of_a_running_job_that_was_cancelled_and_a_failing_callback_changes_nothing():
+    heard = []
+    started = asyncio.Event()
+
+    async def runner(j):
+        started.set()
+        await j.cancel.wait()
+
+    async def on_left(j):
+        heard.append(j.id)
+        raise RuntimeError("the callback is broken")
+
+    q = JobQueue(runner, workers=1, on_left=on_left)
+    q.start()
+    a, b = job(q), job(q)
+    q.add(a)
+    q.add(b)
+    await started.wait()
+    assert q.cancel(a.id) is True
+    await asyncio.sleep(0.05)
+    assert a.id in heard and q.running <= 1  # the worker went on to the next job all the same
+    await q.stop()
+
+
+async def test_on_left_is_not_called_for_a_job_cut_short_by_stopping_the_queue():
+    heard = []
+    started = asyncio.Event()
+
+    async def runner(j):
+        started.set()
+        await asyncio.sleep(10)
+
+    async def on_left(j):
+        heard.append(j.id)
+
+    q = JobQueue(runner, workers=1, on_left=on_left)
+    q.start()
+    q.add(job(q))
+    await started.wait()
+    await q.stop()
+    await asyncio.sleep(0.02)
+    assert heard == []
+
+
 def ordered_job(queue, order, user=1):
     return Job(id=queue.new_id(), user_id=user, chat_id=user, msg_id=order, file_name=f"{order}.mkv", size=1,
                new_name=f"{order}.mkv", order=order)

@@ -113,6 +113,8 @@ class Renamer:
         # called as ``await on_delivered(job, chat, sent)`` once a file renamed with a manual format is in its chat (the offer
         # to upload it to the Database Channel, see dbflow); ``None``: nothing to do
         self.on_delivered: Optional[Callable[[Job, int, Any], Awaitable[None]]] = None
+        # the same for a file renamed with the auto settings (it joins the files the bot asks about sorting, see app)
+        self.on_renamed: Optional[Callable[[Job, int, Any], Awaitable[None]]] = None
 
     # ------------------------------------------------------------------
     async def _fresh_message(self, job: Job) -> Any:
@@ -300,13 +302,16 @@ class Renamer:
         await self._after_delivery(job, target, sent)
 
     async def _after_delivery(self, job: Job, target: int, sent: Any) -> None:
-        """A file renamed with a manual format may go on to the Database Channel: the offer comes after the file itself."""
-        if self.on_delivered is None or job.fmt is None or job.fmt.get("kind") != "manual":
+        """What comes after a file is in its chat: one renamed with a manual format may go on to the Database Channel (the offer comes
+        after the file itself); one renamed with the auto settings is noted for the question about sorting the files."""
+        manual = job.fmt is not None and job.fmt.get("kind") == "manual"
+        hook = self.on_delivered if manual else self.on_renamed
+        if hook is None:
             return
         try:
-            await self.on_delivered(job, target, sent)
+            await hook(job, target, sent)
         except Exception:  # noqa: BLE001 - the rename is done whatever happens here
-            log.exception("could not offer the upload to the Database Channel")
+            log.exception("could not offer the upload to the Database Channel" if manual else "could not note the file for sorting")
 
     async def _run(self, job: Job, s: Dict[str, Any], work: Path, reporter: ProgressReporter, started: float) -> None:
         client = self.client

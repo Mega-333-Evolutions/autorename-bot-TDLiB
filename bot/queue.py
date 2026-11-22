@@ -48,9 +48,11 @@ class JobQueue:
     batch in its original order.
     """
 
-    def __init__(self, runner: Runner, workers: int = 1, on_cancelled: Optional[Runner] = None, settle: float = 0.0):
+    def __init__(self, runner: Runner, workers: int = 1, on_cancelled: Optional[Runner] = None, settle: float = 0.0,
+                 on_left: Optional[Runner] = None):
         self._runner = runner
         self._on_cancelled = on_cancelled
+        self._on_left = on_left  # told of every job once it is out of the queue, however it ended
         self._workers = max(1, workers)
         self._settle = max(0.0, settle)
         self._wake = asyncio.Event()
@@ -122,7 +124,13 @@ class JobQueue:
             self.jobs.pop(job.id, None)
             if self._on_cancelled is not None:
                 asyncio.ensure_future(self._safe(self._on_cancelled, job))
+            self._left(job)
         return True
+
+    def _left(self, job: Job) -> None:
+        """``job`` is out of the queue: its user's queue may be empty now."""
+        if self._on_left is not None:
+            asyncio.ensure_future(self._safe(self._on_left, job))
 
     async def _safe(self, fn: Runner, job: Job) -> None:
         try:
@@ -175,3 +183,4 @@ class JobQueue:
                 if job.state == "running":
                     job.state = "done"
                 self.jobs.pop(job.id, None)
+            self._left(job)  # not reached when the worker itself is being cancelled

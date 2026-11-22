@@ -35,7 +35,7 @@ from .formats import (
 from .parser import compute_new_name, missing_variables, parse_caption, parse_info, split_ext
 from .pipeline import PROBE_EXTS, Renamer, embedded_thumb, original_name_of, source_ext
 from .queue import Job, JobQueue
-from .sequence import SeqItem, SequenceState, analyse, format_report
+from .sequence import SeqItem, SequenceState, SortBatch, analyse, format_report
 from .settings_ops import CLEAR_WORDS, META_COMMANDS, apply_setting, parse_channel, parse_format_channel
 from .telegraph import Telegraph, TelegraphError
 from .tg import Button, errors, events, types
@@ -79,6 +79,8 @@ BACK = {
 }
 PANEL_NAMES = {"home", "rename", "meta", "tool", "ftype", "help", "admin", "formats", "auto"}
 QUEUE_SETTLE = 1.5  # seconds an idle worker waits so files sent together are queued in message order
+SORT_ASK_DELAY = 4.0  # seconds a user's queue has to stay empty before the bot asks whether to sort the files it renamed
+SORT_ASK_MIN = 2  # fewer renamed files than this have nothing to be put in order with: no question
 ONE_FILE_WAIT = 600  # seconds the bot waits for the file after /rename (or /ethumb ...) before forgetting about it
 ONE_SHOT_GRACE = 8  # seconds after a one-file command during which further files get a hint, not an auto-rename
 ONE_SHOT_TAKES = {  # what each one-file command consumes; further files of that kind sent right after it are skipped
@@ -95,7 +97,7 @@ PHOTO_MAX_BYTES = 10 * 1024 * 1024  # biggest photo Telegram takes
 PHOTO_MAX_RATIO = 20  # ... and the longer side of a photo can't be more than this many times the shorter one
 HINT_SECONDS = 5  # how long the hint of /resize stays before it is removed
 SEQUENCE_WAIT = 1800  # seconds /sequence keeps the collected files without a new one arriving
-SEQUENCE_MAX = 1000  # files one /sequence collects
+SEQUENCE_MAX = 1500  # files one /sequence collects
 SEQUENCE_STATUS_DELAY = 1.2  # seconds without a new file before "N files collected" is sent
 SORT_GAP = 0.3  # seconds between the files /sort sends back
 SORT_FAST_FILES = 200  # /sort sends this many files at that pace; the rest of a long batch goes at SORT_SLOW_GAP
@@ -224,7 +226,15 @@ class App:
         self.telegraph = Telegraph(self._load_telegraph_token, self._save_telegraph_token)
         self._tasks: Set["asyncio.Future[Any]"] = set()
         self.renamer = Renamer(client, cfg, db)
-        self.queue = JobQueue(self.renamer.process, workers=cfg.max_jobs, on_cancelled=self._on_job_cancelled, settle=QUEUE_SETTLE)
+        self.queue = JobQueue(
+            self.renamer.process, workers=cfg.max_jobs, on_cancelled=self._on_job_cancelled, settle=QUEUE_SETTLE, on_left=self._on_job_left
+        )
+        # the files renamed with the auto settings since the user last answered "sort these now?", per (user, chat they were sent to)
+        self.sort_batches: Dict[Tuple[int, int], SortBatch] = {}
+        self._sort_tickets = 0  # counts the questions, so the buttons of an old one are told from the current one's
+        self._sort_waiting: Dict[int, int] = {}  # user -> the latest time their queue ran empty; only the wait that began then asks
+        self._intake: Dict[int, int] = {}  # user -> files being queued right now (not in the queue yet)
+        self.renamer.on_renamed = self._sort_noted
         # uploading a manually renamed episode to the Database Channel (and having it published) needs both chats
         self.dbflow: Optional[DbFlow] = DbFlow(client, cfg) if cfg.upload_enabled else None
         if self.dbflow is not None:
@@ -838,14 +848,20 @@ class App:
             await say("Nothing to sort yet. Send /sequence, then the files, then /sort.")
             return
         self._end_mode(uid)
+        await self._sort_files(uid, chat_id, chat_id, state.items, state.status_id)
+
+    async def _sort_files(self, uid: int, home: int, chat_id: int, items: List[SeqItem], status_id: Optional[int] = None) -> None:
+        """Send ``items`` (files in ``chat_id``) again in episode order, then the report.  What the bot says about it goes to ``home``, the
+        chat with the user; the files go back to ``chat_id``, the same chat unless they were sent to the user's channel."""
+        say = lambda text, **kw: self.client.send_message(home, text, parse_mode="html", link_preview=False, **kw)  # noqa: E731
         cancel = self._sorting[uid] = asyncio.Event()
-        total = len(state.items)
+        total = len(items)
         status = None
         try:
-            if state.status_id is not None:
-                await self._delete_quietly(chat_id, state.status_id)
+            if status_id is not None:
+                await self._delete_quietly(home, status_id)
             s = await self.db.get_settings(uid)
-            plan = analyse(state.items, s["mode"])
+            plan = analyse(items, s["mode"])
             status = await say(f"🔢 <b>Sorting {total} file{'s' if total != 1 else ''}…</b>")
 
             sent = 0
@@ -883,7 +899,7 @@ class App:
                 if gap:
                     await self._pause(gap)
             if status is not None:
-                await self._delete_quietly(chat_id, status.id)
+                await self._delete_quietly(home, status.id)
             if stopped:
                 await say(f"⏹ Stopped after {sent} of {total} file{'s' if total != 1 else ''}.")
                 return
@@ -893,6 +909,22 @@ class App:
             self._sorting.pop(uid, None)
 
     async def enqueue(self, event: Any, msg: Any, fmt: Optional[Dict[str, Any]] = None) -> None:
+        """Queue ``msg`` for renaming (``_enqueue`` does it).  While the file is on its way in, the user's queue is not empty; and more
+        files for the auto rename answer "Send more" to a question about sorting that is still open."""
+        uid = event.sender_id
+        if fmt is None or fmt.get("kind") != "manual":
+            self._sort_more(uid)
+        self._intake[uid] = self._intake.get(uid, 0) + 1
+        try:
+            await self._enqueue(event, msg, fmt)
+        finally:
+            self._intake[uid] -= 1
+            if not self._intake[uid]:
+                del self._intake[uid]
+                if not self.queue.for_user(uid):  # nothing was queued (the file was refused, say), so no job will say the queue is empty
+                    self._sort_arm(uid)
+
+    async def _enqueue(self, event: Any, msg: Any, fmt: Optional[Dict[str, Any]]) -> None:
         uid = event.sender_id
         size = int(msg.file.size or 0) if msg.file is not None else 0
         if size > self.cfg.max_file_bytes:
@@ -933,6 +965,107 @@ class App:
             await self.client.edit_message(
                 job.status_msg, f"❌ <b>Cancelled</b>\n<code>{esc(clip(job.new_name, 120))}</code>", buttons=None, parse_mode="html"
             )
+
+    # ------------------------------------------------- "sort these files now?"
+    # The files the bot renames with the auto settings are noted per user and chat.  Once the user's queue has stayed empty for a moment
+    # the bot asks whether to sort them (what /sort does).  Yes: sorted and sent.  No: forgotten, so the next question is only about
+    # files sent after it.  Send more, or more files sent while the question is open: they are kept, and the next question is about all.
+    def _queue_busy(self, uid: int) -> bool:
+        """Has the user a file queued, being renamed, or on its way into the queue?"""
+        return bool(self.queue.for_user(uid)) or uid in self._intake
+
+    def _sort_more(self, uid: int) -> None:
+        """The user sent files for the auto rename: a question about sorting that is still open counts as answered with Send more.  It is
+        taken down; the files stay noted."""
+        for (owner, _chat), batch in self.sort_batches.items():
+            if owner != uid:
+                continue
+            batch.version += 1
+            if batch.prompt_id is not None:
+                self._spawn(self._delete_quietly(batch.home, batch.prompt_id))
+            batch.prompt_id, batch.token = None, 0
+
+    async def _sort_noted(self, job: Job, chat: int, sent: Any) -> None:
+        """A file renamed with the auto settings is in its chat: it joins the files asked about when the queue is empty."""
+        batch = self.sort_batches.setdefault((job.user_id, chat), SortBatch(home=job.chat_id))
+        batch.items.append(SeqItem(msg_id=sent.id, name=job.new_name, caption=getattr(sent, "raw_text", None) or ""))
+        batch.version += 1
+
+    async def _on_job_left(self, job: Job) -> None:
+        self._sort_arm(job.user_id)
+
+    def _sort_arm(self, uid: int) -> None:
+        """The user's queue may be empty now: ask about their renamed files once it has stayed empty for a moment.  Only the last call
+        gets the question asked, so a job that finishes soon after pushes it back."""
+        if not any(owner == uid and batch.items for (owner, _chat), batch in self.sort_batches.items()):
+            return
+        ticket = self._sort_waiting[uid] = self._sort_waiting.get(uid, 0) + 1
+        self._spawn(self._sort_when_idle(uid, ticket))
+
+    async def _sort_when_idle(self, uid: int, ticket: int) -> None:
+        await asyncio.sleep(SORT_ASK_DELAY)
+        if self._sort_waiting.get(uid) != ticket:
+            return  # a later call took over
+        del self._sort_waiting[uid]
+        for key in [k for k in self.sort_batches if k[0] == uid]:
+            if self._queue_busy(uid):
+                return  # more files came in: the job that finishes last asks
+            await self._sort_ask(key)
+
+    async def _sort_ask(self, key: Tuple[int, int]) -> None:
+        batch = self.sort_batches.get(key)
+        if batch is None or batch.prompt_id is not None or not batch.items:
+            return
+        if len(batch.items) < SORT_ASK_MIN:  # nothing to put in order with: not worth a question
+            del self.sort_batches[key]
+            return
+        self._sort_tickets += 1
+        token, seen = self._sort_tickets, batch.version
+        batch.token = token
+        text, rows = panels.sort_question(len(batch.items), key[1], token, elsewhere=key[1] != batch.home)
+        try:
+            sent = await self.client.send_message(batch.home, text, buttons=panels.to_buttons(rows), parse_mode="html")
+        except Exception:  # noqa: BLE001
+            log.exception("could not ask whether to sort the renamed files")
+            if batch.token == token:
+                batch.token = 0
+            return
+        if batch.version != seen or self.sort_batches.get(key) is not batch:  # files were sent while the question went out
+            if batch.token == token:
+                batch.token = 0
+            await self._delete_quietly(batch.home, sent.id)
+            return
+        batch.prompt_id = sent.id
+
+    async def _cb_sort(self, event: Any, uid: int, parts: List[str]) -> None:
+        """The buttons under the question: so:<y|n|m>:<chat the files are in>:<number of the question>."""
+        try:
+            action, chat, token = parts[1], int(parts[2]), int(parts[3])
+        except (IndexError, ValueError):
+            await event.answer()
+            return
+        batch = self.sort_batches.get((uid, chat))
+        if batch is None or batch.prompt_id is None or batch.token != token or action not in ("y", "n", "m"):
+            await event.answer("That question is over.", alert=True)
+            return
+        count = len(batch.items)
+        if action == "y":
+            if uid in self._sorting:
+                await event.answer("I'm still sorting your last batch. /cancel to stop it.", alert=True)
+                return
+            del self.sort_batches[(uid, chat)]
+            await event.answer()
+            await self._remove_message(event)
+            await self._sort_files(uid, batch.home, chat, batch.items)
+        elif action == "n":
+            del self.sort_batches[(uid, chat)]
+            await event.answer()
+            await event.edit(panels.sort_declined(count), buttons=None, parse_mode="html")
+        else:
+            batch.prompt_id, batch.token = None, 0
+            batch.version += 1
+            await event.answer()
+            await event.edit(panels.sort_waits(count), buttons=None, parse_mode="html")
 
     async def cmd_queue(self, event: Any) -> None:
         uid = event.sender_id
@@ -1624,6 +1757,10 @@ class App:
 
         if head == "sq":
             await self._cb_sequence(event, uid, parts)
+            return
+
+        if head == panels.SORT_PREFIX:
+            await self._cb_sort(event, uid, parts)
             return
 
         if head == "sm":

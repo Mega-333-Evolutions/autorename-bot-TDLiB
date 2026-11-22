@@ -495,3 +495,66 @@ async def test_a_transfer_that_took_under_a_second_shows_no_speed(env):
     client, renamer, job = make(env)
     await renamer.process(job)
     assert "Done" in client.edits[-1][0] and "/s" not in client.edits[-1][0]
+
+
+# ---------------------------------------------------------------------------
+# what comes after a file is in its chat
+# ---------------------------------------------------------------------------
+
+
+def hooks(renamer, heard):
+    async def renamed(job, chat, sent):
+        heard.append(("renamed", job.id, chat, sent.id))
+
+    async def delivered(job, chat, sent):
+        heard.append(("delivered", job.id, chat, sent.id))
+
+    renamer.on_renamed, renamer.on_delivered = renamed, delivered
+
+
+@needs_ffmpeg
+async def test_a_file_renamed_with_the_auto_settings_is_handed_to_on_renamed_only(env):
+    heard = []
+    client, renamer, job = make(env)  # no format at all: the auto settings
+    hooks(renamer, heard)
+    await renamer.process(job)
+    assert heard == [("renamed", 1, 42, 3001)] and job.state == "done"
+
+    client, renamer, job = make(env)
+    job.fmt = await make_auto(env)  # an auto format is the auto settings too
+    heard.clear()
+    hooks(renamer, heard)
+    await renamer.process(job)
+    assert heard == [("renamed", 1, 42, 3001)]
+
+
+@needs_ffmpeg
+async def test_a_file_renamed_with_a_manual_format_is_handed_to_on_delivered_only(env):
+    heard = []
+    client, renamer, job = make(env)
+    job.fmt = await make_fmt(env)
+    hooks(renamer, heard)
+    await renamer.process(job)
+    assert heard == [("delivered", 1, 42, 3001)] and job.state == "done"
+
+
+@needs_ffmpeg
+async def test_a_file_that_failed_is_not_handed_to_the_hooks(env):
+    heard = []
+    client, renamer, job = make(env)
+    client.send_errors = [RuntimeError("Telegram said no")]
+    hooks(renamer, heard)
+    await renamer.process(job)
+    assert heard == [] and job.state == "failed"
+
+
+@needs_ffmpeg
+async def test_a_hook_that_breaks_does_not_fail_the_rename(env):
+    client, renamer, job = make(env)
+
+    async def broken(job, chat, sent):
+        raise RuntimeError("the hook is broken")
+
+    renamer.on_renamed = broken
+    await renamer.process(job)
+    assert job.state == "done" and "Done" in client.edits[-1][0]
