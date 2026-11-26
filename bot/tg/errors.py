@@ -77,4 +77,12 @@ def from_td(code: int, message: str, request: Optional[str] = None) -> RPCError:
     return RPCError(message, code, request)
 
 
+DOWNLOAD_STOPPED = "File download has failed or was canceled"  # TDLib's one answer to a download that ends before the file is complete
+
+
+def is_busy(exc: BaseException) -> bool:
+    """Did this fail only because Telegram was too busy: a flood wait, or a download that kept stopping short?  Trying again later may work."""
+    return isinstance(exc, FloodWaitError) or isinstance(exc, RPCError) and DOWNLOAD_STOPPED in exc.message
+
+
 TransferCancelled = Cancelled  # a download or an upload the user stopped: the bot's one "cancelled" exception

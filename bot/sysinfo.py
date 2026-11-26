@@ -162,13 +162,16 @@ def speed_summary(stream: Optional[bool] = None) -> str:
     return " · ".join(f"{short} {'✅' if fine else '⚠️'}" for short, _detail, fine in speed_checks(stream))
 
 
-def format_speed(stats: Any, stream: Optional[bool] = None) -> str:
-    """The Speed section of /status: what is switched on, and how the transfers since the start went."""
+def format_speed(stats: Any, stream: Optional[bool] = None, flood: Any = None) -> str:
+    """The Speed section of /status: what is switched on, and how the transfers since the start went.  ``flood``: what holds the
+    transfers back to stay under Telegram's limits (``bot.flood.FloodControl``)."""
     labels = ("🚀 Transfers", "🔁 Event loop", "⬇⬆ Streaming rename")
     lines = ["⚡ <b>Speed</b>"]
     for label, (_short, detail, fine) in zip(labels, speed_checks(stream)):
         lines.append(f"{label}: {esc(detail)} {'✅' if fine else '⚠️'}")
     lines.append(f"⬇ <b>Downloads:</b> {stats.downloads} · ⬆ <b>Uploads:</b> {stats.uploads}")
+    if flood is not None:
+        lines.append(f"🌊 <b>Telegram's limits:</b> {esc(flood.describe())}")
     if stream is not None:
         lines.append(f"⬇⬆ <b>Streamed renames:</b> {stats.streamed}")
     if stats.stream_fallbacks:

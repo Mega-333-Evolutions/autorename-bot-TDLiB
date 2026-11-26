@@ -97,11 +97,12 @@ class Info:
 _Q = r"(?<![A-Za-z0-9])"
 _QUALITY_RE = re.compile(_Q + r"(?:(2160|1440|1080|720|576|540|480|360|240)[pi]|(4k|uhd))(?![A-Za-z0-9])", re.I)
 _RES_RE = re.compile(_Q + r"\d{3,4}x(\d{3,4})(?![A-Za-z0-9])", re.I)
-_SE_RE = re.compile(_Q + r"S(\d{1,2})[ ._\-]?E(\d{1,4})(?!\d)", re.I)
+_SEP = r"[ ._\-]"  # what may stand between a letter and its number: "S-02 E-08", "S 2 E 8", "S02.E08", "S02 - E08"
+_SE_RE = re.compile(_Q + r"S" + _SEP + r"?(\d{1,2})" + _SEP + r"{0,3}E" + _SEP + r"?(\d{1,4})(?!\d)", re.I)
 _NXN_RE = re.compile(_Q + r"(\d{1,2})x(\d{2,3})(?![A-Za-z0-9])", re.I)
 _SEASON_RE = re.compile(_Q + r"(?:Season|S)[ ._\-]?(\d{1,2})(?![A-Za-z0-9])", re.I)
 _EP_WORD_RE = re.compile(_Q + r"(?:Episode|Ep)[ ._\-]?(\d{1,4})(?!\d)", re.I)
-_E_RE = re.compile(_Q + r"E(\d{1,4})(?![A-Za-z0-9])", re.I)
+_E_RE = re.compile(_Q + r"E" + _SEP + r"?(\d{1,4})(?![A-Za-z0-9])", re.I)
 _DASH_EP_RE = re.compile(r"\s-\s?(\d{1,4})(?:v\d+)?(?=[\s\[\(._\-]|$)")
 _HASH_EP_RE = re.compile(r"#(\d{1,4})(?!\d)")
 # episode written first: "1147 - One Piece" / "1147-One Piece". A 1-2 digit number needs a space beside

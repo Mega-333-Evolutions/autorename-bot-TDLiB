@@ -23,11 +23,15 @@ class Job:
     fmt: Optional[Dict[str, Any]] = None  # the saved format (auto or manual) this job uses, a snapshot taken when it was queued; None: no auto format
     notes: List[str] = field(default_factory=list)  # warnings shown with the queued / finished message
     order: int = 0  # id of the message that triggered the job: files are processed oldest message first
+    sent_at: float = 0.0  # when that message was sent (seconds since 1970); 0: not known
     status_msg: Any = None
     state: str = "queued"  # queued | running | done | failed | cancelled
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     created: float = field(default_factory=time.time)
     started: float = 0.0
+    result: Any = None  # how the job went (a pipeline.Result), kept while it runs
+    attempts: int = 0  # how often the runner gave the job back (state "queued") because Telegram was busy
+    retry_at: float = 0.0  # a job given back is not started before this time (``time.time()``)
 
 
 Runner = Callable[[Job], Awaitable[None]]
@@ -138,9 +142,15 @@ class JobQueue:
         except Exception:  # noqa: BLE001
             log.exception("job callback failed")
 
+    def _retry_in(self) -> Optional[float]:
+        """Seconds until the first of the jobs that were given back is due; ``None`` when none is waiting for its time."""
+        now = time.time()
+        return min((j.retry_at - now for j in self.jobs.values() if j.state == "queued" and j.retry_at > now), default=None)
+
     def _claim(self) -> Optional[Job]:
-        """Take the oldest queued job (no await in between, so two workers never take the same one)."""
-        queued = [j for j in self.jobs.values() if j.state == "queued"]
+        """Take the oldest queued job that is due (no await in between, so two workers never take the same one)."""
+        now = time.time()
+        queued = [j for j in self.jobs.values() if j.state == "queued" and j.retry_at <= now]
         if not queued:
             return None
         job = min(queued, key=_order_key)
@@ -166,7 +176,10 @@ class JobQueue:
             if job is not None:
                 return job
             self._wake.clear()
-            await self._wake.wait()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=self._retry_in())
+            except asyncio.TimeoutError:
+                continue  # a job that was given back is due now
             await self._settle_batch()
 
     async def _worker(self) -> None:
@@ -182,5 +195,10 @@ class JobQueue:
             finally:
                 if job.state == "running":
                     job.state = "done"
-                self.jobs.pop(job.id, None)
-            self._left(job)  # not reached when the worker itself is being cancelled
+                given_back = job.state == "queued"  # the runner put it back to be tried again later: it stays, and is not "left" yet
+                if not given_back:
+                    self.jobs.pop(job.id, None)
+            if given_back:
+                self._wake.set()
+            else:
+                self._left(job)  # not reached when the worker itself is being cancelled

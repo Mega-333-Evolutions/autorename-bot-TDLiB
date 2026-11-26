@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .parser import parse_caption, parse_info, split_ext
 from .utils import clip, esc
 
 MAX_LISTED = 12  # names shown per section of the report
+NOTE_BURST = 5.0  # seconds: a text sent this close before the first file, or after the last one, was sent along with the files
 
 
 @dataclass
@@ -20,6 +22,18 @@ class SeqItem:
     season: Optional[int] = None
     episode: Optional[int] = None
     quality: Optional[int] = None  # picture height: 480, 720, 1080, 1440 (2K), 2160 (4K)
+    source_id: int = 0  # the message the file was renamed from, in the chat with the user (0: not known): where it was among the texts sent
+    sent_at: float = 0.0  # when that message was sent (seconds since 1970; 0: not known)
+
+
+@dataclass
+class Note:
+    """A text message the user sent (no file, no command): the sort can put it among the files, where it was sent."""
+
+    id: int  # the message in the chat with the user
+    text: str
+    entities: List[Any] = field(default_factory=list)  # its formatting, as Telegram delivered it
+    date: float = 0.0  # when it was sent (seconds since 1970)
 
 
 @dataclass
@@ -43,6 +57,7 @@ class SortBatch:
     token: int = 0  # the number of the question that waits for an answer (its buttons carry it); 0: none
     prompt_id: Optional[int] = None  # that question's message
     version: int = 0  # bumped by whatever makes a question that is just being sent out of date
+    texts: List[Note] = field(default_factory=list)  # the text messages the open question asks about including (after Yes to sorting)
 
 
 def detect(name: str, caption: str, mode: str) -> Tuple[Optional[int], Optional[int]]:
@@ -127,6 +142,49 @@ def analyse(items: Sequence[SeqItem], mode: str) -> Analysis:
     )
 
 
+def notes_for(items: Sequence[SeqItem], notes: Sequence[Note]) -> List[Note]:
+    """The text messages that go with these files, oldest first: the ones sent between the first and the last of the files (in the order
+    the files were sent in), and the ones sent in the same moment just before the first or just after the last (a heading forwarded
+    together with the episodes)."""
+    sent = sorted((i for i in items if i.source_id), key=lambda i: i.source_id)
+    if not sent:
+        return []
+    first, last = sent[0], sent[-1]
+    chosen: List[Note] = []
+    for note in sorted(notes, key=lambda n: n.id):
+        if first.source_id < note.id < last.source_id:
+            chosen.append(note)
+        elif note.id < first.source_id and first.sent_at and note.date >= first.sent_at - NOTE_BURST:
+            chosen.append(note)
+        elif note.id > last.source_id and last.sent_at and note.date <= last.sent_at + NOTE_BURST:
+            chosen.append(note)
+    return chosen
+
+
+def place_notes(ordered: Sequence[SeqItem], notes: Sequence[Note]) -> List[Union[SeqItem, Note]]:
+    """``ordered`` (the files in their new order) with the text messages put in: each one right after the file that was sent before it,
+    so it stays between the same two episodes; one sent before every file comes first, one sent after every file last."""
+    by_sent = sorted((i for i in ordered if i.source_id), key=lambda i: i.source_id)
+    ids = [i.source_id for i in by_sent]
+    lead: List[Note] = []
+    tail: List[Note] = []
+    after: Dict[int, List[Note]] = {}
+    for note in sorted(notes, key=lambda n: n.id):
+        before = bisect.bisect_left(ids, note.id)  # how many of the files were sent before this text
+        if before == 0:
+            lead.append(note)
+        elif before == len(ids):
+            tail.append(note)
+        else:
+            after.setdefault(by_sent[before - 1].msg_id, []).append(note)
+    placed: List[Union[SeqItem, Note]] = list(lead)
+    for item in ordered:
+        placed.append(item)
+        placed.extend(after.get(item.msg_id, ()))
+    placed.extend(tail)
+    return placed
+
+
 def _ep(n: int) -> str:
     return f"E{n:02d}"
 
@@ -164,13 +222,19 @@ def _bullets(lines: Sequence[str]) -> List[str]:
     return out
 
 
-def report_sections(a: Analysis, total: int, sent: int, failed: Sequence[SeqItem] = (), note: str = "") -> List[str]:
-    """The pieces of the message shown after the files were sent (HTML), each short enough on its own."""
+def report_sections(
+    a: Analysis, total: int, sent: int, failed: Sequence[SeqItem] = (), note: str = "", texts: Optional[Tuple[int, int]] = None,
+) -> List[str]:
+    """The pieces of the message shown after the files were sent (HTML), each short enough on its own.  ``texts``: how many of the text
+    messages that were to be put in were sent, and how many there were (``None``: none were to be)."""
     seasons = {i.season for i in a.ordered if i.season is not None}
     multi = len(seasons) > 1
     head = f"✅ <b>Sorted {sent} of {total} files</b>" if sent != total else f"✅ <b>Sorted {total} file{'s' if total != 1 else ''}</b>"
     if a.first and a.last:
         head += f" · {_label(*a.first, multi)} → {_label(*a.last, multi)}"
+    if texts and texts[1]:
+        placed, asked = texts
+        head += f" · 📝 {placed} of {asked} text messages" if placed != asked else f" · 📝 {asked} text message{'s' if asked != 1 else ''}"
     parts = [head]
     if note:
         parts.append(note)
@@ -202,12 +266,13 @@ def report_sections(a: Analysis, total: int, sent: int, failed: Sequence[SeqItem
 
 
 def format_report(
-    a: Analysis, total: int, sent: int, failed: Sequence[SeqItem] = (), note: str = "", limit: int = 3600
+    a: Analysis, total: int, sent: int, failed: Sequence[SeqItem] = (), note: str = "", limit: int = 3600,
+    texts: Optional[Tuple[int, int]] = None,
 ) -> List[str]:
     """The report as one message, or a few when the lists are long (Telegram allows about 4000 characters)."""
     messages: List[str] = []
     current = ""
-    for part in report_sections(a, total, sent, failed, note):
+    for part in report_sections(a, total, sent, failed, note, texts):
         if current and len(current) + 2 + len(part) > limit:
             messages.append(current)
             current = part

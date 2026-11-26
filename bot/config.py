@@ -85,6 +85,8 @@ class Config:
     db_channel: Optional[int] = None  # the Database Channel a manually renamed episode can be uploaded to
     comm_chat: Optional[int] = None  # the chat where this bot and the channel post bot talk to each other
     post_bot_id: int = DEFAULT_POST_BOT_ID
+    max_uploads: int = 1  # files uploaded at the same time, however many jobs run (Telegram's flood limits are per IP address)
+    max_downloads: int = 2  # files downloaded at the same time, however many jobs run
 
     @property
     def max_file_bytes(self) -> int:
@@ -144,4 +146,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> Config:
         db_channel=db_channel,
         comm_chat=comm_chat,
         post_bot_id=post_bot_id,
+        max_uploads=max(1, min(_get_int(env, "MAX_UPLOADS", 1), 4)),
+        max_downloads=max(1, min(_get_int(env, "MAX_DOWNLOADS", 2), 4)),
     )

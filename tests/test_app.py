@@ -13,6 +13,7 @@ from bot import errorlog, panels, transfer
 from bot.app import COMMANDS, OWNER_COMMANDS, PANEL_NAMES, App, Pending, cmd_pattern, is_renameable
 from bot.config import load_config
 from bot.db import Database
+from bot.flood import FloodControl
 from bot.queue import JobQueue
 
 from .conftest import needs_ffmpeg
@@ -685,6 +686,15 @@ async def test_status_shows_what_makes_transfers_fast_and_how_they_went(ctx, mon
     transfer.stats.stream_failed(RuntimeError("boom"))
     text = (await say(ctx, OWNER, "/status")).texts[0]
     assert "Streaming failed 1×" in text and "RuntimeError: boom" in text
+
+
+async def test_status_shows_what_holds_the_transfers_back_when_the_client_has_a_limiter(ctx):
+    assert "Telegram's limits" not in (await say(ctx, OWNER, "/status")).texts[0]  # (the fake client has none)
+    ctx.client.flood = FloodControl(uploads=1, downloads=2)
+    assert "🌊 <b>Telegram's limits:</b> 0/1 uploads · 0/2 downloads · no flood · 0 flood waits since the start" in (await say(ctx, OWNER, "/status")).texts[0]
+    ctx.client.flood.hit(9.0, transfer=True)
+    text = (await say(ctx, OWNER, "/status")).texts[0]
+    assert "holding back for" in text and "1 flood wait since the start" in text
 
 
 async def test_status_survives_a_failed_ping(ctx, monkeypatch, caplog):

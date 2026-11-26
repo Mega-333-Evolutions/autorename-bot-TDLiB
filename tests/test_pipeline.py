@@ -1,20 +1,26 @@
+import asyncio
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from bot import errorlog
+from bot import errorlog, media
 from bot.config import load_config
 from bot.db import Database
+from bot.errors import MediaError
+from bot.flood import FloodControl
 from bot.media import probe
 from bot.parser import DEFAULT_TEMPLATE, compute_new_name
-from bot.pipeline import Renamer, decide_send_type, guess_mime, original_name_of, source_ext
+from bot.pipeline import Renamer, decide_send_type, guess_mime, has_thumbnail, original_name_of, source_ext
 from bot.queue import Job
-from bot.tg import errors, types
+from bot.tg import Message, errors, types
 
 from .appkit import ensure_auto
 from .conftest import needs_ffmpeg
+from .tdfakes import document_content, td_message, thumbnail_of
+from .timeline import Timeline
 
 
 class FakeMessage:
@@ -58,7 +64,7 @@ class FakeClient:
         self.sent.append((target, source, kwargs))
         return SimpleNamespace(id=3000 + len(self.sent))
 
-    async def edit_message(self, message, text, buttons=None, parse_mode=None):
+    async def edit_message(self, message, text, buttons=None, parse_mode=None, **_):
         self.edits.append((text, buttons))
 
 
@@ -558,3 +564,517 @@ async def test_a_hook_that_breaks_does_not_fail_the_rename(env):
     renamer.on_renamed = broken
     await renamer.process(job)
     assert job.state == "done" and "Done" in client.edits[-1][0]
+
+
+# ---------------------------------------------------------------------------
+# a file that failed only because Telegram was busy is tried again
+# ---------------------------------------------------------------------------
+
+STOPPED_SHORT = f"{errors.DOWNLOAD_STOPPED} (stopped short 8 times)"
+
+
+def heard_results(renamer):
+    heard = []
+
+    async def result(job, outcome):
+        heard.append((job.id, outcome.state, outcome))
+
+    renamer.on_result = result
+    return heard
+
+
+@needs_ffmpeg
+async def test_a_file_that_failed_because_telegram_was_busy_is_given_back_with_a_pause(env):
+    client, renamer, job = make(env)
+    heard = heard_results(renamer)
+    client.download_error = errors.RPCError(STOPPED_SHORT, 400)
+    await renamer.process(job)
+    assert job.state == "queued" and job.attempts == 1 and 55 < job.retry_at - time.time() <= 60
+    text, buttons = client.edits[-1]
+    assert "Telegram was busy" in text and "Trying again in 1:00 (try 2 of 3)" in text and "Failed" not in text
+    assert buttons[0][0].type.data == b"job:x:1"  # it can still be cancelled while it waits
+    assert heard == [] and client.sent == []  # it is not over
+    assert not (Path(env.cfg.temp_dir) / "job1").exists()
+
+
+@needs_ffmpeg
+async def test_a_flood_wait_that_was_too_long_to_wait_out_is_given_back_too(env):
+    client, renamer, job = make(env)
+    client.send_errors = [errors.FloodWaitError(900)]
+    await renamer.process(job)
+    assert job.state == "queued" and job.attempts == 1
+
+
+@needs_ffmpeg
+async def test_the_second_new_try_waits_longer_and_the_third_failure_is_final(env):
+    client, renamer, job = make(env)
+    heard = heard_results(renamer)
+    client.download_error = errors.RPCError(STOPPED_SHORT, 400)
+    await renamer.process(job)
+    job.state = "running"  # (the queue starts it again)
+    await renamer.process(job)
+    assert job.state == "queued" and job.attempts == 2 and 175 < job.retry_at - time.time() <= 180
+    assert "Trying again in 3:00 (try 3 of 3)" in client.edits[-1][0]
+    job.state = "running"
+    await renamer.process(job)
+    assert job.state == "failed" and job.attempts == 2
+    text, buttons = client.edits[-1]
+    assert "Failed" in text and "File download has failed" in text and "Tried 3 times." in text and buttons is None
+    (job_id, state, outcome), = heard
+    assert (job_id, state, outcome.retries) == (1, "failed", 2) and "File download has failed" in outcome.reason
+
+
+@needs_ffmpeg
+async def test_a_file_that_succeeds_after_a_new_try_is_a_success_with_its_retries_counted(env):
+    client, renamer, job = make(env)
+    heard = heard_results(renamer)
+    client.download_error = errors.RPCError(STOPPED_SHORT, 400)
+    await renamer.process(job)
+    client.download_error = None
+    job.state = "running"
+    await renamer.process(job)
+    assert job.state == "done" and "Done" in client.edits[-1][0]
+    (_id, state, outcome), = heard
+    assert state == "done" and outcome.retries == 1 and "Tried" not in client.edits[-1][0]
+
+
+@needs_ffmpeg
+async def test_other_failures_are_final_at_once(env):
+    client, renamer, job = make(env)
+    heard = heard_results(renamer)
+    client.download_error = errors.RPCError("FILE_REFERENCE_EXPIRED", 400)
+    await renamer.process(job)
+    assert job.state == "failed" and job.attempts == 0 and "Tried" not in client.edits[-1][0]
+    assert [state for _id, state, _o in heard] == ["failed"]
+
+
+@needs_ffmpeg
+async def test_a_job_the_user_cancelled_is_not_given_back(env):
+    client, renamer, job = make(env)
+
+    async def cancel_then_fail(*args, **kwargs):
+        job.cancel.set()
+        raise errors.RPCError(STOPPED_SHORT, 400)
+
+    client.download_to = cancel_then_fail
+    await renamer.process(job)
+    assert job.state == "failed" and job.attempts == 0
+
+
+@needs_ffmpeg
+async def test_a_cancelled_job_is_reported_as_cancelled_to_on_result(env):
+    client, renamer, job = make(env)
+    heard = heard_results(renamer)
+    job.cancel.set()
+    await renamer.process(job)
+    assert [(state, outcome.reason) for _id, state, outcome in heard] == [("cancelled", "")]
+
+
+@needs_ffmpeg
+async def test_a_finished_file_tells_on_result_what_was_checked_and_warned_about(env):
+    client, renamer, job = make(env)
+    heard = heard_results(renamer)
+    job.notes = ["Couldn't find {episode} in the file name, so it is left empty."]
+    await renamer.process(job)
+    (_id, state, outcome), = heard
+    assert state == "done" and outcome.warnings == job.notes and outcome.retries == 0 and not outcome.thumb_resent
+
+
+@needs_ffmpeg
+async def test_a_hook_that_breaks_when_told_the_result_does_not_fail_the_rename(env):
+    client, renamer, job = make(env)
+
+    async def broken(job, outcome):
+        raise RuntimeError("the hook is broken")
+
+    renamer.on_result = broken
+    await renamer.process(job)
+    assert job.state == "done"
+
+
+# ---------------------------------------------------------------------------
+# only so many transfers at once
+# ---------------------------------------------------------------------------
+
+
+class BusyClient(FakeClient):
+    """Counts the transfers that run at the same moment (each one takes a little while)."""
+
+    def __init__(self, source, message):
+        super().__init__(source, message)
+        self.now = {"down": 0, "up": 0}
+        self.peak = {"down": 0, "up": 0}
+        self.gates = {"down": None, "up": None}  # while a gate is not set the transfers of that kind do not finish
+        self.pause = 0.03  # how long a transfer takes
+        self.uploading = []  # the names of the files whose upload began, in that order
+
+    async def _hold(self, kind):
+        self.now[kind] += 1
+        self.peak[kind] = max(self.peak[kind], self.now[kind])
+        try:
+            await asyncio.sleep(self.pause)
+            if self.gates[kind] is not None:
+                await self.gates[kind].wait()
+        finally:
+            self.now[kind] -= 1
+
+    async def download_to(self, message, dest, **kwargs):
+        await self._hold("down")
+        return await super().download_to(message, dest, **kwargs)
+
+    async def send_file(self, target, source, **kwargs):
+        self.uploading.append(next(a.file_name for a in kwargs["attributes"] if isinstance(a, types.DocumentAttributeFilename)))
+        await self._hold("up")
+        return await super().send_file(target, source, **kwargs)
+
+
+async def until(condition, seconds=20.0):
+    """Wait (at most ``seconds``) until ``condition()`` is true."""
+    end = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < end, "the state the test waits for was never reached"
+        await asyncio.sleep(0.01)
+
+
+def several(env, count, flood, client_class=BusyClient):
+    client, renamer, first = make(env)
+    busy = client_class(client.source, client.message)
+    busy.flood = flood
+    renamer = Renamer(busy, env.cfg, env.db)
+    jobs = []
+    for number in range(1, count + 1):
+        jobs.append(Job(id=number, user_id=42, chat_id=42, msg_id=7, file_name=first.file_name, size=first.size,
+                        new_name=f"[S01E0{number}] Tokyo Revengers [1080p].mkv", status_msg=SimpleNamespace(id=90 + number, chat_id=42)))
+    return busy, renamer, jobs
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("uploads, downloads", [(1, 2), (1, 1), (2, 3)])
+async def test_however_many_jobs_run_only_so_many_transfers_do(env, uploads, downloads):
+    flood = FloodControl(uploads=uploads, downloads=downloads)
+    client, renamer, jobs = several(env, 5, flood)
+    client.gates = {"down": asyncio.Event(), "up": asyncio.Event()}  # every transfer lasts until its gate is opened
+    tasks = [asyncio.ensure_future(renamer.process(job)) for job in jobs]
+    await until(lambda: client.now["down"] == downloads and flood.downloads.waiting == 5 - downloads)  # as many as may, the rest in line
+    client.gates["down"].set()
+    await until(lambda: client.now["up"] == uploads and flood.uploads.waiting >= 1)
+    client.gates["up"].set()
+    await asyncio.wait_for(asyncio.gather(*tasks), 60)
+    assert [job.state for job in jobs] == ["done"] * 5
+    assert client.peak == {"down": downloads, "up": uploads}
+    assert flood.uploads.used == flood.downloads.used == 0  # every place was given back
+
+
+@needs_ffmpeg
+async def test_a_job_that_has_to_wait_for_a_turn_says_so(env):
+    flood = FloodControl(uploads=1, downloads=1)
+    client, renamer, jobs = several(env, 3, flood)
+    client.gates = {"down": asyncio.Event(), "up": asyncio.Event()}
+    tasks = [asyncio.ensure_future(renamer.process(job)) for job in jobs]
+    await until(lambda: flood.downloads.waiting == 2)  # one is downloading, the other two wait for it
+    client.gates["down"].set()
+    await until(lambda: flood.uploads.used == 1 and flood.uploads.waiting >= 1)
+    client.gates["up"].set()
+    await asyncio.wait_for(asyncio.gather(*tasks), 60)
+    waiting = [text for text, _b in client.edits if "Waiting for a turn" in text]
+    assert waiting and any("downloaded" in text for text in waiting) and any("uploaded" in text for text in waiting)
+    assert all(job.state == "done" for job in jobs)
+
+
+@needs_ffmpeg
+async def test_a_job_that_waits_for_a_flood_to_be_over_says_so_and_starts_afterwards(env):
+    line = Timeline()
+    flood = FloodControl(clock=line.clock, sleep=line.sleep, jitter=lambda: 0.0)
+    client, renamer, (job,) = several(env, 1, flood, FakeClient)
+    flood.hit(3)
+    await renamer.process(job)
+    assert job.state == "done" and line.waited() == [3.5]
+    assert any("Telegram asked the bot to slow down" in text and "Starting again in a moment." in text for text, _b in client.edits)
+
+
+@needs_ffmpeg
+async def test_cancelling_a_job_that_waits_for_its_turn_takes_it_out_of_the_line(env):
+    flood = FloodControl(uploads=1, downloads=2)
+    client, renamer, jobs = several(env, 2, flood)
+    client.gates["up"] = asyncio.Event()  # the upload that has its turn does not finish until this is set
+    tasks = {job.id: asyncio.ensure_future(renamer.process(job)) for job in jobs}
+    await until(lambda: flood.uploads.waiting and client.now["up"])
+    assert flood.uploads.waiting == 1 and len(client.uploading) == 1  # one is uploading, the other waits for its turn (which one is chance)
+    holder = next(job for job in jobs if job.new_name == client.uploading[0])
+    waiter = next(job for job in jobs if job is not holder)
+    waiter.cancel.set()
+    await asyncio.wait_for(tasks[waiter.id], 10)
+    assert waiter.state == "cancelled" and flood.uploads.waiting == 0 and flood.uploads.used == 1
+    client.gates["up"].set()
+    await asyncio.wait_for(tasks[holder.id], 10)
+    assert holder.state == "done" and flood.uploads.used == 0 and len(client.sent) == 1
+    assert any("Cancelled" in text for text, _b in client.edits)
+
+
+@needs_ffmpeg
+async def test_without_a_flood_control_nothing_waits_and_nothing_is_said_about_it(env):
+    client, renamer, jobs = several(env, 3, None)
+    del client.flood
+    client.gates["up"] = asyncio.Event()
+    tasks = [asyncio.ensure_future(renamer.process(job)) for job in jobs]
+    await until(lambda: client.now["up"] == 3)  # nothing holds them back: all three upload at the same time
+    client.gates["up"].set()
+    await asyncio.wait_for(asyncio.gather(*tasks), 60)
+    assert [job.state for job in jobs] == ["done"] * 3
+    assert client.peak["up"] == 3 and not any("Waiting" in text for text, _b in client.edits)
+
+
+# ---------------------------------------------------------------------------
+# the thumbnail: did Telegram keep it?
+# ---------------------------------------------------------------------------
+
+
+class RealClient(FakeClient):
+    """Answers with ``Message`` objects, as Telegram does: ``thumbs[n]`` says whether the n-th file sent has its thumbnail."""
+
+    def __init__(self, source, message, thumbs=()):
+        super().__init__(source, message)
+        self.thumbs = list(thumbs)
+        self.deleted = []
+        self.delete_error = None
+        self.sizes = {}  # what to tell about a file: {"size": ..., "name": ...}
+
+    async def send_file(self, target, source, **kwargs):
+        reply = await super().send_file(target, source, **kwargs)
+        number = len(self.sent)
+        kept = self.thumbs[number - 1] if number <= len(self.thumbs) else True
+        name = self.sizes.get("name") or next(a.file_name for a in kwargs["attributes"] if isinstance(a, types.DocumentAttributeFilename))
+        size = self.sizes.get("size") or Path(source).stat().st_size
+        content = document_content(name, size, file_id=100 + number, thumbnail=thumbnail_of(file_id=200 + number) if kept else None)
+        return Message(td_message(content, chat_id=target, plain_id=reply.id, out=True))
+
+    async def delete_messages(self, chat, ids):
+        if self.delete_error:
+            raise self.delete_error
+        self.deleted.append((chat, list(ids)))
+
+
+def real(env, thumbs=(), **msg_kwargs):
+    client, renamer, job = make(env, **msg_kwargs)
+    client = RealClient(client.source, client.message, thumbs)
+    renamer = Renamer(client, env.cfg, env.db)
+    return client, renamer, job
+
+
+def test_a_thumbnail_counts_once_telegram_has_it():
+    assert has_thumbnail(Message(td_message(document_content("a.mkv", 10, thumbnail=thumbnail_of()))))
+    assert not has_thumbnail(Message(td_message(document_content("a.mkv", 10))))
+    assert not has_thumbnail(Message(td_message(document_content("a.mkv", 10, minithumbnail="AAAA"))))  # the tiny blurred one is not it
+    local_only = thumbnail_of()
+    local_only["file"]["remote"] = {"@type": "remoteFile", "id": "", "unique_id": "", "is_uploading_active": False, "is_uploading_completed": False, "uploaded_size": 0}
+    assert not has_thumbnail(Message(td_message(document_content("a.mkv", 10, thumbnail=local_only))))  # never got to Telegram
+    assert not has_thumbnail(SimpleNamespace(id=1))
+    finished = thumbnail_of()
+    finished["file"]["remote"] = {"@type": "remoteFile", "id": "", "unique_id": "", "is_uploading_active": False, "is_uploading_completed": True, "uploaded_size": 10}
+    assert has_thumbnail(Message(td_message(document_content("a.mkv", 10, thumbnail=finished))))  # an upload that finished is there, whatever the id says
+
+
+@needs_ffmpeg
+async def test_a_file_that_kept_its_thumbnail_is_sent_once_and_the_check_says_so(env):
+    client, renamer, job = real(env)
+    heard = heard_results(renamer)
+    await renamer.process(job)
+    assert len(client.sent) == 1 and client.deleted == [] and job.state == "done"
+    done = client.edits[-1][0]
+    assert "🔍 Checked: size · name · thumbnail" in done and "⚠️" not in done
+    (_i, _s, outcome), = heard
+    assert outcome.checks == "size · name · thumbnail" and not outcome.thumb_resent
+
+
+@needs_ffmpeg
+async def test_a_file_that_went_out_without_its_thumbnail_is_sent_again_and_the_first_copy_deleted(env):
+    client, renamer, job = real(env, thumbs=[False, True])
+    heard, kept = heard_results(renamer), []
+
+    async def renamed(job, chat, sent):
+        kept.append(sent.id)
+
+    renamer.on_renamed = renamed
+    await renamer.process(job)
+    assert len(client.sent) == 2 and client.deleted == [(42, [3001])]  # the first copy is gone
+    assert kept == [3002]  # what goes on from here (the question about sorting, say) is the copy that stays
+    done = client.edits[-1][0]
+    assert "🔍 Checked: size · name · thumbnail" in done and "⚠️" not in done and job.state == "done"
+    assert heard[0][2].thumb_resent
+    assert any("Uploading again (its thumbnail was lost)" in text for text, _b in client.edits)
+    first, second = client.sent[0], client.sent[1]
+    assert first[2]["thumb"] == second[2]["thumb"] and first[2]["reply_to"] == second[2]["reply_to"] == 7  # the same file, thumbnail and reply
+
+
+@needs_ffmpeg
+async def test_a_file_that_is_still_without_its_thumbnail_after_a_new_send_stays_with_a_warning(env):
+    client, renamer, job = real(env, thumbs=[False, False])
+    heard = heard_results(renamer)
+    await renamer.process(job)
+    assert len(client.sent) == 2 and client.deleted == [(42, [3001])]  # one copy is enough
+    done = client.edits[-1][0]
+    assert "⚠️ Telegram left the thumbnail out again." in done and "🔍 Checked: size · name\n" in done and job.state == "done"  # (no "thumbnail" checked)
+    assert heard[0][2].warnings == ["Telegram left the thumbnail out again."]
+
+
+@needs_ffmpeg
+async def test_when_sending_again_fails_the_first_copy_stays_with_a_warning(env):
+    client, renamer, job = real(env, thumbs=[False])
+    heard = heard_results(renamer)
+    original = client.send_file
+    calls = []
+
+    async def second_fails(target, source, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise errors.FloodWaitError(900)
+        return await original(target, source, **kwargs)
+
+    client.send_file = second_fails
+    await renamer.process(job)
+    assert client.deleted == [] and job.state == "done"
+    assert "Telegram sent the file without its thumbnail, and sending it again failed (FloodWaitError)." in client.edits[-1][0]
+    assert heard[0][2].state == "done" and not heard[0][2].thumb_resent
+
+
+@needs_ffmpeg
+async def test_a_copy_that_cannot_be_deleted_is_a_warning_and_nothing_more(env):
+    client, renamer, job = real(env, thumbs=[False, True])
+    client.delete_error = errors.RPCError("MESSAGE_DELETE_FORBIDDEN", 400)
+    await renamer.process(job)
+    assert job.state == "done" and "⚠️ The first copy, which has no thumbnail, could not be deleted." in client.edits[-1][0]
+
+
+@needs_ffmpeg
+async def test_files_in_a_row_that_stay_without_thumbnails_stop_being_sent_again_for_a_while(env, monkeypatch):
+    from bot import pipeline
+
+    client, renamer, job = real(env, thumbs=[False] * 40)
+    for number in range(1, 5):
+        job = Job(id=number, user_id=42, chat_id=42, msg_id=7, file_name=job.file_name, size=job.size, new_name=job.new_name,
+                  status_msg=SimpleNamespace(id=99))
+        before = len(client.sent)
+        await renamer.process(job)
+        sends = len(client.sent) - before
+        assert sends == (2 if number <= pipeline.THUMB_STRIKES else 1)  # the fourth is not sent again: three in a row went wrong
+    assert "⚠️ Telegram sent the file without its thumbnail." in client.edits[-1][0]
+    clock = [time.monotonic() + pipeline.THUMB_PAUSE + 1]
+    monkeypatch.setattr(pipeline, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    client.thumbs = [True] * 40
+    client.thumbs[len(client.sent)] = False  # the next one lacks its thumbnail again, but it is tried now
+    before = len(client.sent)
+    await renamer.process(Job(id=9, user_id=42, chat_id=42, msg_id=7, file_name=job.file_name, size=job.size, new_name=job.new_name,
+                              status_msg=SimpleNamespace(id=99)))
+    assert len(client.sent) - before == 2 and renamer._thumb_strikes == 0  # and a copy that has its thumbnail starts the count again
+
+
+@needs_ffmpeg
+async def test_a_file_that_keeps_its_thumbnail_starts_the_count_of_lost_ones_again(env):
+    from bot import pipeline
+
+    # sends, in order: file 1 lost, lost again; file 2 lost, lost again; file 3 kept; files 4, 5 and 6 lost twice each; file 7 lost
+    client, renamer, job = real(env, thumbs=[False, False, False, False, True] + [False] * 40)
+    sends = []
+    for number in range(1, 8):
+        before = len(client.sent)
+        await renamer.process(Job(id=number, user_id=42, chat_id=42, msg_id=7, file_name=job.file_name, size=job.size, new_name=job.new_name,
+                                  status_msg=SimpleNamespace(id=99)))
+        sends.append(len(client.sent) - before)
+    assert sends == [2, 2, 1, 2, 2, 2, 1]  # the good one in the middle made it "three in a row" only after file 6, not after file 4
+    assert renamer._thumb_strikes == pipeline.THUMB_STRIKES
+
+
+@needs_ffmpeg
+async def test_a_file_that_had_no_thumbnail_to_send_is_not_looked_at(env, monkeypatch):
+    client, renamer, job = real(env, thumbs=[False])
+    monkeypatch.setattr(media, "make_video_thumbnail", lambda *args, **kwargs: _false())
+    await renamer.process(job)
+    assert len(client.sent) == 1 and client.sent[0][2]["thumb"] is None and client.deleted == []
+    done = client.edits[-1][0]
+    assert "⚠️ No thumbnail could be made from the video, so it went out without one." in done and "🔍 Checked: size · name\n" in done
+
+
+async def _false():
+    return False
+
+
+# ---------------------------------------------------------------------------
+# what was looked at once the file was sent
+# ---------------------------------------------------------------------------
+
+
+@needs_ffmpeg
+async def test_a_file_whose_size_or_name_differs_in_telegram_is_a_warning(env):
+    client, renamer, job = real(env)
+    client.sizes = {"size": 12345, "name": "something else.mkv"}
+    await renamer.process(job)
+    done = client.edits[-1][0]
+    assert "Telegram has 12.06 KB and the file sent was " in done
+    assert "Telegram calls the file “something else.mkv”, not “[S01E05] Tokyo Revengers [1080p].mkv”." in done
+    assert "🔍 Checked: thumbnail" in done and job.state == "done"
+
+
+@needs_ffmpeg
+async def test_the_tracks_of_a_file_with_new_metadata_are_checked_and_listed(env):
+    await env.db.update_settings(
+        42, metadata_on=True, keep_audio=["english", "japanese"], keep_subtitle=["2"],
+        meta={"title": "Tokyo Revengers", "audio": "{lang}", "subtitle": "English"},
+    )
+    client, renamer, job = real(env)
+    await renamer.process(job)
+    done = client.edits[-1][0]
+    assert "🔍 Checked: size · name · tracks (1 video · 2 audio · 1 subtitles) · thumbnail" in done and "⚠️" not in done
+
+
+@needs_ffmpeg
+async def test_a_title_that_did_not_come_through_is_a_warning_and_the_new_file_is_used(env, monkeypatch):
+    await env.db.update_settings(42, metadata_on=True, meta={"title": "Tokyo Revengers"})
+    monkeypatch.setattr(media, "check_remux", lambda *args: ([], ["The title was not applied."]))
+    client, renamer, job = real(env)
+    await renamer.process(job)
+    assert "⚠️ The title was not applied." in client.edits[-1][0] and "tracks (" in client.edits[-1][0]
+    assert (await probe(client.uploads[0])).tags.get("title") == "Tokyo Revengers"  # the file ffmpeg made went out
+
+
+@needs_ffmpeg
+async def test_a_file_that_is_not_what_was_asked_for_is_not_sent_the_original_goes_out_as_it_is(env, monkeypatch):
+    await env.db.update_settings(42, metadata_on=True, meta={"title": "Tokyo Revengers"})
+    monkeypatch.setattr(media, "check_remux", lambda *args: (["only 1 of 3 audio tracks came through"], ["a note"]))
+    client, renamer, job = real(env)
+    heard = heard_results(renamer)
+    await renamer.process(job)
+    assert job.state == "done"
+    assert client.uploads[0].read_bytes() == (env.media_dir / "sample.mkv").read_bytes()  # untouched
+    done = client.edits[-1][0]
+    assert "⚠️ The metadata and track changes could not be made (only 1 of 3 audio tracks came through), so the file went out as it was." in done
+    assert "a note" not in done and "tracks (" not in done
+    assert heard[0][2].warnings[-1].startswith("The metadata and track changes could not be made")
+
+
+@needs_ffmpeg
+async def test_when_ffmpeg_itself_fails_the_original_goes_out_as_it_is_and_the_user_is_told(env, monkeypatch):
+    await env.db.update_settings(42, metadata_on=True, meta={"title": "Tokyo Revengers"})
+
+    async def boom(*args, **kwargs):
+        raise MediaError("ffmpeg failed: boom")
+
+    monkeypatch.setattr(media, "apply_plan", boom)
+    client, renamer, job = real(env)
+    await renamer.process(job)
+    assert job.state == "done" and client.uploads[0].read_bytes() == (env.media_dir / "sample.mkv").read_bytes()
+    assert "could not be made (ffmpeg failed: boom), so the file went out as it was." in client.edits[-1][0]
+
+
+@needs_ffmpeg
+async def test_a_cancel_while_ffmpeg_runs_is_still_a_cancel(env, monkeypatch):
+    from bot.errors import Cancelled
+
+    await env.db.update_settings(42, metadata_on=True, meta={"title": "Tokyo Revengers"})
+
+    async def stopped(*args, **kwargs):
+        raise Cancelled()
+
+    monkeypatch.setattr(media, "apply_plan", stopped)
+    client, renamer, job = real(env)
+    await renamer.process(job)
+    assert job.state == "cancelled" and client.sent == []

@@ -27,12 +27,12 @@ Send a file → it is downloaded, renamed, optionally tagged / trimmed, and sent
 | Caption & thumbnail | Caption template: **format it in Telegram like any message** (bold, italic, links, …) and that formatting is kept; the default is the new name in **bold**. Custom thumbnail, automatic video-frame thumbnail otherwise. Every format has its own, and they are edited only on the format's screen in `/format` (the `/start` menu has no Template, Caption or Thumbnail buttons, and a photo you send is never made a thumbnail by itself) |
 | Metadata and tracks | **Default metadata** (`/metadata` panel): titles to write into the files, and **Keep Audio / Keep Subtitle**, which keeps only the listed tracks, in your order (stream copy, nothing is re-encoded). A format copies it with one tap: **Apply default metadata** |
 | Database Channel | Set `DB_CHANNEL` and `COMMUNICATION_CHAT` and every episode you rename with `/rename` can go on to your **Database Channel** (Yes / No): copied inside Telegram, nothing is downloaded or uploaded again. A manual format's **Channel** option then makes the **channel post bot** publish it there (see *Uploading to the Database Channel*) |
-| Episode order | `/sequence` → send files in any order → `/sort`: they come back in episode order (season, then episode, then quality), with the **missing** and **repeated** episodes listed. After a batch of renames the bot also offers to do this by itself (**Yes / No / Send more**) |
+| Episode order | `/sequence` → send files in any order → `/sort`: they come back in episode order (season, then episode, then quality), with the **missing** and **repeated** episodes listed. After a batch of renames the bot also offers to do this by itself (**Yes / No / Send more**), and puts the text messages you sent among the files back in their places if you want |
 | Inspect | `/check` (what the bot reads from a name and caption), `/tracks`, `/mediainfo` (everything MediaInfo can read, on a **Telegraph page**), `/dc` (the data center a file is stored on) |
 | Pictures | `/ethumb` (the thumbnail of a file or video), `/size` (the dimensions of a picture) and `/resize 720 1080` (the picture at exactly that size): reply to the picture |
 | Speed test | `/speed`: an Ookla Speedtest from the machine the bot runs on |
 | Start banner | Owner command `/smedia`: pick an image or a GIF for `/start` right in the chat. No environment variable |
-| Queue | Files are processed **in the order you sent them** (even a forwarded batch), `/queue`, `/cancel`, live progress with speed / ETA and a Cancel button, FloodWait handling |
+| Queue | Files are processed **in the order you sent them** (even a forwarded batch), `/queue`, `/cancel`, live progress with speed / ETA and a Cancel button. Made for **big batches** (100+ files): the bot paces itself to stay under Telegram's flood limits, checks every file after sending it, and sends a **report** when the batch is done (see *Big batches*) |
 | Access | Owner, admins and guest admins (`/addadmin`, `/deladmin`, `/addgadmin`, `/delgadmin`); everyone else is ignored (and reported to the log channel) |
 | Extras | Send results to a channel (`/setchannel`), error log chat (`LOG_CHANNEL`: every error with its full traceback), `/status`, `/stats`, health endpoint for cron pings |
 | Speed | **TDLib** (a native library: it splits a file into parts and moves several at once, there is nothing to set) and `uvloop` for the bot's own code. `/status` shows what is active and how many downloads and uploads went through (see *Is it really fast?* below). **Experimental, off by default:** `STREAM_RENAME=1` uploads a big file while it is still downloading (see *Streaming renames*) |
@@ -55,8 +55,8 @@ Send a file → it is downloaded, renamed, optionally tagged / trimmed, and sent
    (a private Space needs the header `Authorization: Bearer <your HF token>`).
 6. Open the bot and send `/start`. As the owner, send `/smedia` to put an image or a GIF on it.
 
-All settings (see `.env.example`): `ADMIN_IDS`, `LOG_CHANNEL`, `MAX_CONCURRENT_JOBS` (1), `MAX_FILE_MB` (2000), `PROGRESS_INTERVAL` (4),
-`BOT_DC` (the bot's data center, if you know it), `TDLIB_DIR` (where TDLib keeps its files, `/tmp/tdlib`), `TDLIB_LOG_LEVEL` (1),
+All settings (see `.env.example`): `ADMIN_IDS`, `LOG_CHANNEL`, `MAX_CONCURRENT_JOBS` (1), `MAX_UPLOADS` (1), `MAX_DOWNLOADS` (2), `MAX_FILE_MB` (2000),
+`PROGRESS_INTERVAL` (4), `BOT_DC` (the bot's data center, if you know it), `TDLIB_DIR` (where TDLib keeps its files, `/tmp/tdlib`), `TDLIB_LOG_LEVEL` (1),
 `STREAM_RENAME` (0, experimental) and, for the Database Channel, `DB_CHANNEL`, `COMMUNICATION_CHAT` and `CHANNEL_POST_BOT_ID` (8950016484).
 The old `START_IMAGE` setting is gone: use `/smedia`. `SESSION_STRING`, `TRANSFER_CONNECTIONS` and `FAST_TRANSFER` belonged to the Telethon
 version and do nothing now (the log says so when one of them is still set).
@@ -306,8 +306,74 @@ renamed into a channel (`/setchannel`), the files are in the channel, so the sor
 you in the bot chat. Every user has their own queue and their own batches. The batches are kept in memory: a restart forgets them (use `/sequence` for files that are already in a chat).
 
 The first 200 files go out with only a short pause between them; after that the bot sends roughly one a second, which is about what
-Telegram allows in a single chat without making the bot wait. A full batch of 1500 therefore takes roughly 25–30 minutes. The bot
+Telegram allows in a single chat without making the bot wait. A full batch of 1500 therefore takes in the order of 20 to 30 minutes (it also depends on how fast Telegram answers each send). The bot
 looks the files up 100 at a time while it sends, so the first one arrives straight away.
+
+#### Text messages among the files
+
+If you forward text messages together with the files (a heading such as *Goat Island Arc · 🔊 Audio - Dual Audio* that sits between episode 0135
+and 0136, say), the bot notes them while it renames. **Only when there are such texts**, and you answer **Yes** to the question above, it asks
+one more thing before it starts:
+
+> 📝 **Do you want to include the non-media messages in the sort as well?**  `✅ Yes`  `❌ No`
+
+* **Yes**: each text is sent again **in the same place**, right after the file that came before it in your chat, so the heading is between 0135 and
+  0136 of the sorted files too (with its formatting). The report says how many texts were put in.
+* **No**: only the files are sorted, and those texts are forgotten.
+
+Without a text message there is no second question. Which texts count: the ones sent **between** the first and the last file of the batch, and a
+text sent together with the files before the first one or after the last one (within about 5 seconds of them, the same forwarded burst; it goes
+first or last). A text from long before or long after is left out. Commands and messages that carry a file are never texts in this sense, and the
+bot keeps at most the last 300 texts per user, for 12 hours, in memory.
+
+### Big batches
+
+A hundred files at once is where a Telegram bot gets throttled. Telegram's limits belong to **the address the bot runs from**, not to a user:
+a second person's files count against the same limit as yours. Bots that serve many people usually cope in the same few ways: they move one or two files at
+a time whatever the number of users, they edit their progress messages rarely, they wait when Telegram says so, and many run from an address of their
+own. This bot does the first three by itself:
+
+* **Few transfers at once.** However many files are being worked on (`MAX_CONCURRENT_JOBS`), at most `MAX_UPLOADS` (1) are uploaded and
+  `MAX_DOWNLOADS` (2) downloaded at the same moment; the others wait for their turn (their message says *Waiting for a turn*). Reading the tracks,
+  ffmpeg and the thumbnail go on meanwhile, so a second or third job still helps a little. A streaming rename (`STREAM_RENAME=1`) takes an upload place
+  and a download place together.
+* **Fewer edits.** Progress messages are edited at most once per `PROGRESS_INTERVAL` seconds, a chat's edits are at least 1.1 s apart, and when
+  several files show progress in the same chat each message is edited less often (three running: about every 7.5 s).
+* **Waiting when Telegram asks.** When Telegram says "too many requests", nothing new starts until that is over, and the files that were moving wait it
+  out and go on. A flood that a transfer met also lowers the transfers at once (down to one) for a while; they come back one step after each quiet minute.
+  `/status` shows the limits, how many places are taken, and whether the bot is holding back (🌊 *Telegram's limits*).
+* **Patient downloads.** A download that stops short (TDLib has one answer for that: `File download has failed or was canceled`) is started again
+  after 5, 15, 30 and then 60 seconds, from what had arrived. It is given up only after 8 stops in a row without a single new byte.
+* **Tried again when Telegram was busy.** A file that failed only because Telegram was busy goes back in the queue and is tried again after 1 minute,
+  then after 3 minutes (its message says *Telegram was busy* and when the next try is); it fails if the third try fails too.
+
+**Checked after sending.** Once a file is in your chat the bot compares what Telegram says it received with what it sent: the **size**, the **file name**, the
+**tracks** (after ffmpeg changed them) and the **thumbnail**. The Done message says what was checked (`🔍 Checked: size · name · tracks (1 video, 2 audio) · thumbnail`),
+and whatever does not match is a ⚠️ line instead. Before that, ffmpeg's own file is checked too: if it is empty, a track you asked for did not come through, or it is
+shorter than the original, it is not used: the original goes out as it was, with a ⚠️. The bot does not play the video: it checks the container, the tracks
+and the thumbnail, not the picture itself.
+
+* A file that came out **without its thumbnail** (it happens when the thumbnail upload fails while Telegram is busy, and nothing says so) is sent again once; the
+  first copy is deleted after the second is there. If three files in a row still have no thumbnail when sent again, the bot stops sending again for 10 minutes
+  (such files are still reported, with a ⚠️).
+* A streaming rename cannot be sent again (the file is never kept), so it only warns.
+
+**The report.** When your queue has been empty for a few seconds after a batch of **two or more** files, you get one message, just before the question about sorting:
+
+> 📋 **Batch finished:** 97 of 100 files renamed
+>
+> ✅ 94 checked after sending: size · name · thumbnail
+> ⚠️ 3 renamed, with a warning:
+> • `One Piece - 0056.mkv` Telegram sent the file without its thumbnail.
+> 🖼 2 lost their thumbnail on the way and were sent again
+> 🔁 5 had to be tried again because Telegram was busy
+> ❌ 3 failed:
+> • `One Piece - 0046.mkv` RPCError: File download has failed or was canceled (stopped short 8 times) (400)
+> Send the failed ones again to retry them.
+
+The ✅ line names only what was checked on **every** file it counts; ❔ counts files Telegram gave no details of, so they could not be checked. The lists name
+the first 8 files of each kind and count the rest. A file that went out with a warning is renamed, so it is counted in *renamed*. One file alone gets no report:
+its own message says it all. The notes a report is made of are kept in memory: a restart forgets them.
 
 ### `/check`
 
@@ -466,9 +532,11 @@ messages show a ⚠️ line saying so (the value is left empty), so a missing nu
 | Logs repeat connection errors | The Space cannot reach Telegram. Restart / rebuild the Space (it may land on another host). `TDLIB_LOG_LEVEL=2` shows more of what TDLib is doing |
 | Settings, formats or admins vanish after a restart | Set `DATABASE_URL` (Postgres). Without it SQLite lives on the temporary disk, and TDLib's saved login (and the chats it has seen) goes with it |
 | Slow transfers | `/status` → **Speed**: the lines should have ✅ (a `no uvloop` ⚠️ only slows the bot's own code). The Done message shows ⬇ / ⬆ MB/s for each file, and `/dc` tells where a file is stored: one on a DC far from the Space is slower, because TDLib keeps only 2 MB in flight per DC for a bot (see *Is it really fast?*). There is nothing to tune in TDLib itself. For a batch, `MAX_CONCURRENT_JOBS=2` overlaps one file's upload with the next one's download, but then files can come back out of order (a small one can overtake a big one), so keep it at 1 when the order matters |
-| An upload or download sits still for a while, then goes on | TDLib reconnects and retries by itself, and Telegram can also ask a bot to wait (a *flood wait*; short ones are waited out automatically). Keep `MAX_CONCURRENT_JOBS` low when several files run together. If it keeps happening, send the log, with `TDLIB_LOG_LEVEL=2` set |
-| `FloodWaitError` in a failed job | Telegram asked the bot to slow down. A flood wait of up to a minute while a file goes out is waited out and the file is sent again from where it stopped, as often as it takes (10 minutes of waiting in all, `FLOOD_PATIENCE` in `bot/tg/client.py`), so a job fails only when one wait was longer than a minute or the waits kept coming back for more than ten minutes. Several uploads at once are what gets a bot throttled: lower `MAX_CONCURRENT_JOBS`, then send the file again |
-| `File download has failed or was canceled` in a failed job | TDLib's one answer when a download ends before the whole file is there (Telegram asking it to wait for too long, a lost connection ...). The bot waits 5, 15 and 30 seconds and starts the download again, and TDLib goes on from what had arrived; the job fails only when all four tries stopped short (the error says `stopped short 4 times`). As above, fewer files at once helps. With `TDLIB_LOG_LEVEL=2` the Space log has TDLib's own line `Failed to download file …` with the reason |
+| An upload or download sits still for a while, then goes on | TDLib reconnects and retries by itself, and Telegram can also ask a bot to wait (a *flood wait*): the bot waits it out and starts nothing new meanwhile. `/status` shows 🌊 *Telegram's limits* (places in use, *holding back for …s*, flood waits since the start); after a flood the bot moves fewer files at once for a while (see *Big batches*). If it keeps happening, send the log, with `TDLIB_LOG_LEVEL=2` set |
+| `FloodWaitError` in a failed job | Telegram asked the bot to slow down. A flood wait of up to a minute while a file goes out is waited out and the file is sent again from where it stopped, as often as it takes (10 minutes of waiting in all, `FLOOD_PATIENCE` in `bot/tg/client.py`), so a job fails only when one wait was longer than a minute or the waits kept coming back for more than ten minutes. Uploads at the same moment are what gets a bot throttled: the bot already does one at a time (`MAX_UPLOADS=1`) and moves fewer after a flood. If floods still come often, lower `MAX_DOWNLOADS` and `MAX_CONCURRENT_JOBS`, and send the failed file again (the batch report lists it) |
+| `File download has failed or was canceled` in a failed job | TDLib's one answer when a download ends before the whole file is there (Telegram asking it to wait for too long, a lost connection ...). The bot starts the download again after 5, 15, 30 and then 60 seconds, and TDLib goes on from what had arrived; the job fails only after 8 stops in a row without a single new byte (the error says `stopped short N times`), or when the file cannot be downloaded at all. While Telegram is asking the bot to slow down, nothing new starts. A file that failed is listed in the batch report: send it again. With `TDLIB_LOG_LEVEL=2` the Space log has TDLib's own line `Failed to download file …` with the reason |
+| Some files came back without a thumbnail | The thumbnail is uploaded separately, and when that fails while Telegram is busy the file goes out without it, silently. The bot checks every file after sending: it sends such a file again once and deletes the first copy (the Done message and the batch report say so). A ⚠️ *Telegram sent the file without its thumbnail* means it could not be fixed: a streaming rename cannot be sent again (`STREAM_RENAME=0` avoids that), and after three files in a row that still had none the bot stops sending again for 10 minutes |
+| How do I know nothing is wrong with the tracks or the metadata of 100 files? | Read the batch report: ✅ is what was checked on every file, ⚠️ names the files that did not pass. Each file's Done message has its own `🔍 Checked:` line. The bot compares the file Telegram stored with the one it made (size, name, tracks, thumbnail) and checks ffmpeg's output before sending it; a file ffmpeg did not get right goes out as the original, with a ⚠️. It does not play the video, so damage inside the picture itself is not detected |
 | Nothing arrives in the log chat | `LOG_CHANNEL` must be the numeric id (like `-1001234567890`) and the bot must be an admin there. The Space log says `could not send an error report` if Telegram refuses |
 | The log says `cannot access LOG_CHANNEL …`, `cannot access DB_CHANNEL …` or `cannot access COMMUNICATION_CHAT …` | TDLib lets a bot use a chat only after it has seen something from it. Add the bot to that chat as an admin and post any message there (see *A chat has to be "seen"* above). The same goes for a format's **Channel** and `/setchannel` |
 | Share format says "Sharing needs inline mode" | @BotFather → `/mybots` → your bot → Bot Settings → Inline Mode → Turn on, then tap the button again |
@@ -496,7 +564,7 @@ pip install -r requirements.txt
 export API_ID=… API_HASH=… BOT_TOKEN=… OWNER_ID=…     # needs ffmpeg + ffprobe on PATH
 python -m bot
 
-pip install -r requirements-dev.txt && pytest          # 1300+ tests, no network needed
+pip install -r requirements-dev.txt && pytest          # 1600+ tests, no network needed
 ```
 
 `pymediainfo` brings its own MediaInfo library. For `/speed` locally, install Ookla's CLI as `ookla-speedtest` (or set

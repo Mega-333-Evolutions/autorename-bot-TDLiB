@@ -10,6 +10,8 @@ from bot.media import (
     apply_plan,
     build_plan,
     canonical_lang,
+    check_remux,
+    count_tracks,
     extract_frame,
     format_tracks,
     frame_seeks,
@@ -553,3 +555,170 @@ async def test_extract_frame_gives_up_on_junk_without_raising(tmp_path):
     junk.write_bytes(b"\x00" * 4096)
     assert not await extract_frame(junk, tmp_path / "j.jpg", [1.0, 0.0])
     assert not await extract_frame(tmp_path / "missing.mkv", tmp_path / "m.jpg", [0.0])
+
+
+# ---------------------------------------------------------------------------
+# looking at what ffmpeg made
+# ---------------------------------------------------------------------------
+
+
+def test_a_plan_says_what_the_new_file_has_to_hold():
+    plan = build_plan(
+        make_info(),
+        {"metadata_on": True, "keep_audio": ["english", "japanese"], "keep_subtitle": ["2"],
+         "meta": {"title": "Show", "author": "@chan", "artist": "@me", "audio": "{lang} Audio", "subtitle": "English", "video": "HD"}},
+        ".mkv",
+    )
+    assert plan.expect == {"video": 1, "audio": 2, "subtitle": 1}
+    assert plan.titles == [("video", 0, "HD"), ("audio", 0, "English Audio"), ("audio", 1, "Japanese Audio"), ("subtitle", 0, "English")]
+    assert plan.tags == {"title": "Show", "artist": "@me"}  # the author is not looked for: a container may have no place for it
+
+
+def test_a_plan_without_a_filter_expects_every_track_and_one_for_tags_only_expects_the_audio():
+    plan = build_plan(make_info(), {"metadata_on": True, "meta": {"title": "T"}}, ".mkv")
+    assert plan.expect == {"video": 1, "audio": 3, "subtitle": 2} and plan.titles == []
+    song = MediaInfo(streams=[Stream(0, "audio", codec="mp3"), Stream(1, "video", codec="mjpeg", attached_pic=True)])
+    plan = build_plan(song, {"metadata_on": True, "meta": {"title": "T", "artist": "A"}}, ".mp3")
+    assert plan.expect == {"audio": 1} and plan.tags == {"title": "T", "artist": "A"}
+
+
+def test_the_cover_picture_of_a_file_is_not_a_video_track_to_look_for():
+    info = MediaInfo(streams=[Stream(0, "video", codec="h264"), Stream(1, "video", codec="mjpeg", attached_pic=True), audio(2, "eng")])
+    plan = build_plan(info, {"metadata_on": True, "meta": {"title": "T", "video": "HD"}}, ".mkv")
+    assert plan.expect["video"] == 1 and plan.titles == [("video", 0, "HD")]  # (the picture is no video track, and gets no title)
+
+
+def test_the_tracks_of_a_file_are_counted_for_a_line_of_text():
+    assert count_tracks(make_info()) == "1 video · 3 audio · 2 subtitles"
+    assert count_tracks(MediaInfo(streams=[Stream(0, "audio")])) == "1 audio"
+    assert count_tracks(MediaInfo()) == ""
+    cover = MediaInfo(streams=[Stream(0, "video", attached_pic=True), Stream(1, "audio")])
+    assert count_tracks(cover) == "1 audio"
+
+
+def result_of(plan_info, **changes):
+    """What ffprobe would say about the file made from ``plan_info``: the same, unless ``changes`` say otherwise."""
+    done = MediaInfo(duration=plan_info.duration, format_name=plan_info.format_name, tags=dict(plan_info.tags),
+                     streams=[Stream(**vars(s)) for s in plan_info.streams])
+    for key, value in changes.items():
+        setattr(done, key, value)
+    return done
+
+
+def planned(**meta):
+    info = make_info()
+    info.duration = 100.0
+    plan = build_plan(info, {"metadata_on": True, "meta": meta or {"title": "Show"}}, ".mkv")
+    return info, plan
+
+
+def test_a_file_with_every_track_and_its_length_is_fine():
+    info, plan = planned(title="Show", audio="{lang}")
+    done = result_of(info, tags={"title": "Show"})
+    for number, track in enumerate(done.audio):
+        track.title = ["Japanese", "English", "Hindi"][number]
+    assert check_remux(info, plan, done, 5000) == ([], [])
+
+
+def test_an_empty_file_is_a_problem():
+    info, plan = planned()
+    assert check_remux(info, plan, result_of(info), 0) == (["the new file is empty"], [])
+
+
+def test_a_track_that_did_not_come_through_is_a_problem():
+    info, plan = planned()
+    done = result_of(info, tags={"title": "Show"})
+    done.streams = [s for s in done.streams if s.index not in (2, 5)]  # an audio track and a subtitle are gone
+    problems, notes = check_remux(info, plan, done, 5000)
+    assert problems == ["only 2 of 3 audio tracks came through", "only 1 of 2 subtitle tracks came through"] and notes == []
+    done.streams = [s for s in done.streams if s.kind != "video"]
+    assert "only 0 of 1 video tracks came through" in check_remux(info, plan, done, 5000)[0]
+
+
+def test_extra_tracks_are_no_problem():
+    info, plan = planned()
+    done = result_of(info, tags={"title": "Show"})
+    done.streams.append(Stream(9, "audio"))
+    assert check_remux(info, plan, done, 5000) == ([], [])
+
+
+@pytest.mark.parametrize("seconds, short", [(100.0, False), (98.5, False), (98.0, False), (97.9, True), (60.0, True), (0.0, False)])
+def test_a_file_that_is_shorter_than_the_original_is_a_problem_but_a_little_is_not(seconds, short):
+    info, plan = planned()  # 100 s: two seconds (or 2%, when that is more) are let go
+    problems, _notes = check_remux(info, plan, result_of(info, duration=seconds, tags={"title": "Show"}), 5000)
+    assert bool(problems) is short
+    if short:
+        assert problems[0].startswith("the new file is ") and "the original 1:40" in problems[0]
+
+
+def test_the_allowed_difference_grows_with_the_length_of_the_file():
+    info, plan = planned()
+    info.duration = 3600.0  # 2% of an hour is 72 seconds
+    assert check_remux(info, plan, result_of(info, duration=3530.0, tags={"title": "Show"}), 5000)[0] == []
+    assert check_remux(info, plan, result_of(info, duration=3500.0, tags={"title": "Show"}), 5000)[0] != []
+
+
+def test_a_length_that_is_not_known_is_not_held_against_the_file():
+    info, plan = planned()
+    assert check_remux(info, plan, result_of(info, duration=0.0, tags={"title": "Show"}), 5000)[0] == []
+    info.duration = 0.0
+    assert check_remux(info, plan, result_of(info, duration=50.0, tags={"title": "Show"}), 5000)[0] == []
+
+
+def test_a_title_that_did_not_come_through_is_a_note_and_no_problem():
+    info, plan = planned(title="Show", audio="Track {lang}", subtitle="English")
+    done = result_of(info, tags={})
+    done.audio[0].title = "Track Japanese"
+    done.audio[1].title = "something else"
+    problems, notes = check_remux(info, plan, done, 5000)
+    assert problems == []
+    assert notes == [
+        "The title of audio track 2 was not applied.", "The title of audio track 3 was not applied.",
+        "The title of subtitle track 1 was not applied.", "The title of subtitle track 2 was not applied.", "The title was not applied.",
+    ]
+
+
+def test_titles_are_compared_without_the_spaces_around_them():
+    info, plan = planned(title="Show", audio="Japanese")
+    done = result_of(info, tags={"title": " Show "})
+    for track in done.audio:
+        track.title = " Japanese\n"
+    assert check_remux(info, plan, done, 5000) == ([], [])
+
+
+def test_the_tags_of_an_audio_file_are_looked_for():
+    info = MediaInfo(duration=10, streams=[Stream(0, "audio", codec="mp3")])
+    plan = build_plan(info, {"metadata_on": True, "meta": {"title": "T", "artist": "A"}}, ".mp3")
+    assert check_remux(info, plan, result_of(info, tags={"title": "T", "artist": "A"}), 100) == ([], [])
+    assert check_remux(info, plan, result_of(info, tags={"title": "T"}), 100) == ([], ["The artist was not applied."])
+    assert check_remux(info, plan, result_of(info, streams=[]), 100)[0] == ["only 0 of 1 audio tracks came through"]
+
+
+@needs_ffmpeg
+async def test_a_real_remux_passes_its_own_check(media_dir, tmp_path):
+    source = await probe(media_dir / "sample.mkv")
+    plan = build_plan(
+        source, {"metadata_on": True, "keep_audio": ["english", "japanese"], "keep_subtitle": ["2"],
+                 "meta": {"title": "Tokyo Revengers", "audio": "{lang}", "subtitle": "English", "video": "HD"}}, ".mkv",
+    )
+    out = tmp_path / "out.mkv"
+    await apply_plan(media_dir / "sample.mkv", out, plan)
+    assert check_remux(source, plan, await probe(out), out.stat().st_size) == ([], [])
+
+
+@needs_ffmpeg
+async def test_a_real_file_that_lost_tracks_fails_the_check_of_the_plan_that_wanted_them(media_dir, tmp_path):
+    source = await probe(media_dir / "sample.mkv")
+    wanted = build_plan(source, {"metadata_on": True, "meta": {"title": "T"}}, ".mkv")  # every track
+    fewer = build_plan(source, {"metadata_on": True, "keep_audio": ["1"], "keep_subtitle": ["french"], "meta": {"title": "T"}}, ".mkv")
+    out = tmp_path / "fewer.mkv"
+    await apply_plan(media_dir / "sample.mkv", out, fewer)
+    problems, _notes = check_remux(source, wanted, await probe(out), out.stat().st_size)
+    assert problems == ["only 1 of 3 audio tracks came through", "only 0 of 2 subtitle tracks came through"]
+
+
+@needs_ffmpeg
+async def test_a_thumbnail_is_tried_nearer_the_start_when_there_is_no_picture_where_it_looks_first(media_dir, tmp_path):
+    out = tmp_path / "t.jpg"
+    assert await make_video_thumbnail(media_dir / "sample.mkv", out, 1400.0)  # ten percent of that is far past the end of the sample
+    assert out.read_bytes()[:2] == b"\xff\xd8"

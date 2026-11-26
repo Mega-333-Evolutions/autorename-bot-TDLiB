@@ -1,6 +1,7 @@
 import pytest
 
-from bot.sequence import MAX_LISTED, SeqItem, analyse, detect, detect_quality, format_report, ranges
+from bot.sequence import (MAX_LISTED, NOTE_BURST, Note, SeqItem, analyse, detect, detect_quality, format_report, notes_for, place_notes,
+                          ranges)
 
 
 def item(mid, name, caption=""):
@@ -339,3 +340,107 @@ def test_a_huge_report_is_split_into_messages_telegram_accepts():
     joined = "\n\n".join(messages)
     assert "Missing episodes" in joined and "Repeated episodes" in joined and "No episode number found" in joined and "Couldn't be sent" in joined
     assert messages[0].startswith("✅ <b>Sorted")
+
+
+# ---------------------------------------------------------------------------
+# text messages among the files
+# ---------------------------------------------------------------------------
+
+
+def sent(copy, source, name="", at=1000.0):
+    """A renamed file: ``copy`` is the message it was sent as, ``source`` the message it was renamed from."""
+    return SeqItem(msg_id=copy, name=name or f"file {source}", source_id=source, sent_at=at)
+
+
+def note(nid, text="heading", at=1000.0):
+    return Note(id=nid, text=text, date=at)
+
+
+def layout(placed):
+    """The files (by the number in their name) and the texts (in brackets) of ``place_notes``, in order."""
+    return [f"[{x.text}]" if isinstance(x, Note) else x.name for x in placed]
+
+
+def test_a_text_goes_right_after_the_file_that_was_sent_before_it():
+    files = [sent(901, 10, "134"), sent(902, 11, "135"), sent(903, 13, "136")]
+    assert layout(place_notes(files, [note(12, "Goat Island Arc")])) == ["134", "135", "[Goat Island Arc]", "136"]
+
+
+def test_the_place_follows_the_order_the_files_were_sent_in_not_the_order_they_were_renamed_in():
+    # sent: 134 (10), 135 (11), the text (12), 136 (13); renamed in another order, so their copies have other numbers
+    files = [sent(905, 10, "134"), sent(903, 11, "135"), sent(904, 13, "136")]
+    assert layout(place_notes(files, [note(12)])) == ["134", "135", "[heading]", "136"]
+
+
+def test_a_file_sent_out_of_order_takes_its_text_with_it_to_where_the_sort_puts_the_files():
+    # sent: 136 (1), 134 (2), the text (3), 135 (4): the text follows 134, whichever way the files are put in order
+    ordered = [sent(902, 2, "134"), sent(903, 4, "135"), sent(901, 1, "136")]
+    assert layout(place_notes(ordered, [note(3)])) == ["134", "[heading]", "135", "136"]
+
+
+def test_several_texts_after_the_same_file_keep_the_order_they_were_sent_in():
+    files = [sent(901, 10, "134"), sent(902, 20, "135")]
+    assert layout(place_notes(files, [note(13, "third"), note(11, "first"), note(12, "second")])) == [
+        "134", "[first]", "[second]", "[third]", "135"]
+
+
+def test_a_text_sent_before_every_file_comes_first_and_one_sent_after_every_file_last():
+    files = [sent(901, 10, "134"), sent(902, 11, "135")]
+    assert layout(place_notes(files, [note(50, "end"), note(5, "start")])) == ["[start]", "134", "135", "[end]"]
+
+
+def test_a_text_is_put_after_an_earlier_file_when_the_one_right_before_it_was_not_renamed():
+    # 135 (11) failed and is not among the files: the text that came after it goes after 134, so it is still between 134 and 136
+    files = [sent(901, 10, "134"), sent(903, 13, "136")]
+    assert layout(place_notes(files, [note(12)])) == ["134", "[heading]", "136"]
+
+
+def test_a_file_that_does_not_know_what_it_was_sent_from_is_never_where_a_text_goes_after():
+    files = [sent(901, 0, "unknown"), sent(902, 10, "134"), sent(903, 20, "135")]
+    assert layout(place_notes(files, [note(15)])) == ["unknown", "134", "[heading]", "135"]
+    assert layout(place_notes([sent(901, 0, "unknown")], [note(15)])) == ["[heading]", "unknown"]
+
+
+def test_no_texts_leave_the_files_as_they_are():
+    files = [sent(901, 10, "134"), sent(902, 11, "135")]
+    assert place_notes(files, []) == files
+
+
+def test_the_texts_that_go_with_the_files_are_the_ones_sent_between_the_first_and_the_last():
+    files = [sent(901, 10, at=0), sent(902, 20, at=0), sent(903, 30, at=0)]
+    texts = [note(5), note(15), note(25), note(35)]
+    assert [n.id for n in notes_for(files, texts)] == [15, 25]  # (with no date known for the files, nothing outside them goes along)
+    assert notes_for(files, []) == [] and notes_for([], texts) == []
+
+
+def test_a_text_sent_in_the_same_moment_just_before_the_first_file_or_just_after_the_last_goes_along():
+    files = [sent(901, 10, at=1000), sent(902, 20, at=1002), sent(903, 30, at=1010)]
+    texts = [note(8, at=1000 - NOTE_BURST), note(9, at=1000 - NOTE_BURST - 1), note(31, at=1010 + NOTE_BURST), note(32, at=1010 + NOTE_BURST + 1)]
+    assert [n.id for n in notes_for(files, texts)] == [8, 31]  # a text from long before or long after is somebody else's
+
+
+def test_texts_come_back_oldest_first_and_files_without_a_source_are_not_counted():
+    files = [sent(901, 10, at=1000), sent(902, 20, at=1000), SeqItem(msg_id=903, name="x")]
+    assert [n.id for n in notes_for(files, [note(18), note(12), note(15)])] == [12, 15, 18]
+    assert notes_for([SeqItem(msg_id=1, name="x"), SeqItem(msg_id=2, name="y")], [note(5)]) == []
+
+
+def test_the_report_says_how_many_text_messages_were_put_in():
+    plan = analyse([item(1, "Show S01E01.mkv"), item(2, "Show S01E02.mkv")], "filename")
+    assert "📝 2 text messages" in format_report(plan, 2, 2, texts=(2, 2))[0]
+    assert "📝 1 text message" in format_report(plan, 2, 2, texts=(1, 1))[0] and "1 text messages" not in format_report(plan, 2, 2, texts=(1, 1))[0]
+    assert "📝 1 of 3 text messages" in format_report(plan, 2, 2, texts=(1, 3))[0]
+    assert "📝" not in format_report(plan, 2, 2)[0] and "📝" not in format_report(plan, 2, 2, texts=(0, 0))[0]
+
+
+def test_the_same_moment_is_a_few_seconds_long():
+    files = [sent(901, 10, at=1000), sent(902, 20, at=1002), sent(903, 30, at=1010)]
+    texts = [note(8, at=1000 - 4), note(9, at=1000 - 6), note(31, at=1010 + 4), note(32, at=1010 + 6)]
+    assert [n.id for n in notes_for(files, texts)] == [8, 31]  # (5 seconds is what the README says: "within about 5 seconds")
+
+
+def test_files_that_were_renamed_in_another_order_than_they_were_sent_in_are_taken_in_the_order_they_were_sent_in():
+    # sent: 134 (10), 135 (11), a text (12), 136 (13); the renaming did 136 first, so its copy has the lowest number; no date is known
+    files = [sent(902, 10, "134", at=0), sent(903, 11, "135", at=0), sent(901, 13, "136", at=0)]
+    assert [n.id for n in notes_for(files, [note(12, at=0)])] == [12]
+    assert layout(place_notes(files, [note(12)])) == ["134", "135", "[heading]", "136"]

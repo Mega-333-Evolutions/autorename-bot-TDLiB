@@ -19,7 +19,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from . import entities as E
 from . import errors
@@ -29,14 +29,19 @@ from .events import StopPropagation
 from .ids import from_td_message_id, to_td_message_id
 from .message import Message, User
 
+if TYPE_CHECKING:
+    from ..flood import FloodControl
+
 log = logging.getLogger(__name__)
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")  # sent as a picture unless the caller says "as a file"
 _FILE_TYPE_OF_ID = {2: "photo", 3: "voice", 4: "video", 5: "document", 9: "audio", 10: "animation", 13: "video_note"}
 _KIND_CACHE = 512
 FLOOD_PATIENCE = 600.0  # seconds of flood waits one send waits out in all (it is sent again after each) before the flood wait is raised
-DOWNLOAD_RETRY_DELAYS = (5.0, 15.0, 30.0)  # seconds before each new try of a download that stopped short (one try more per delay)
-_DOWNLOAD_STOPPED = "File download has failed or was canceled"  # TDLib's one answer to a download that ends before the file is complete
+DOWNLOAD_RETRY_DELAYS = (5.0, 15.0, 30.0, 60.0)  # seconds before a new try of a download that stopped short, by how many stops in a row brought no new byte (the last repeats)
+DOWNLOAD_STALLS = 8  # stops in a row without a single new byte after which a download is given up
+DOWNLOAD_STOP_FLOOD = 8.0  # a download that stopped short counts as a flood wait of this many seconds (TDLib itself waits that long on a "retry after")
+_DOWNLOAD_STOPPED = errors.DOWNLOAD_STOPPED
 
 
 def plain(value: Any) -> Any:
@@ -99,10 +104,11 @@ def _jpeg_size(data: bytes) -> Tuple[int, int]:
 
 class Client:
     def __init__(self, td: Any, *, tmp_dir: Optional[Union[str, Path]] = None, parse_mode: Optional[str] = "html",
-                 flood_sleep_threshold: int = 60, bot_dc: Optional[int] = None):
+                 flood_sleep_threshold: int = 60, bot_dc: Optional[int] = None, flood: Optional["FloodControl"] = None):
         self._td = td
         self.parse_mode = parse_mode
         self.flood_sleep_threshold = flood_sleep_threshold
+        self.flood = flood  # what keeps the bot under Telegram's limits (see bot.flood); without one nothing is held back
         self.session = SimpleNamespace(dc_id=bot_dc)  # the data center the bot is on: from the setting, else from the first file it sends
         self.tmp_dir = Path(tmp_dir) if tmp_dir else Path(tempfile.gettempdir()) / "tg-send"
         self._handlers: List[Tuple[Callable[..., Any], Any]] = []
@@ -144,17 +150,21 @@ class Client:
         task.add_done_callback(_outcome_seen)
         return await asyncio.shield(task)
 
-    async def _call(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """One TDLib request.  A flood wait that is short enough is waited out and the request repeated."""
+    async def _call(self, request: Dict[str, Any], *, patient: bool = True) -> Dict[str, Any]:
+        """One TDLib request.  A flood wait that is short enough is waited out and the request repeated (not when ``patient`` is off:
+        a request that can be left out, like the progress of a transfer, is not worth waiting for)."""
         for attempt in range(4):
             answer = plain(await self._invoke(request))
             if not isinstance(answer, dict) or answer.get("@type") != "error":
                 return answer if isinstance(answer, dict) else {}
             error = errors.from_td(answer.get("code") or 0, answer.get("message") or "", request.get("@type"))
-            if isinstance(error, errors.FloodWaitError) and error.seconds <= self.flood_sleep_threshold and attempt < 3:
-                log.info("flood wait of %ss on %s", error.seconds, request.get("@type"))
-                await asyncio.sleep(error.seconds + 0.5)
-                continue
+            if isinstance(error, errors.FloodWaitError):
+                if self.flood is not None:
+                    self.flood.hit(error.seconds)
+                if patient and error.seconds <= self.flood_sleep_threshold and attempt < 3:
+                    log.info("flood wait of %ss on %s", error.seconds, request.get("@type"))
+                    await asyncio.sleep(max(error.seconds + 0.5, self.flood.cooling_left() if self.flood is not None else 0.0))
+                    continue
             raise error
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -295,6 +305,9 @@ class Client:
                 pause = exc.seconds + 0.5
                 if exc.seconds > self.flood_sleep_threshold or waited + pause > FLOOD_PATIENCE:
                     raise
+                if self.flood is not None:  # everything else that is about to start waits for the flood too
+                    self.flood.hit(exc.seconds, transfer=content.get("@type") != "inputMessageText")
+                    pause = max(pause, self.flood.cooling_left())
                 log.info("flood wait of %ss while sending: sending again (%ss waited so far)", exc.seconds, waited)
                 waited += pause
                 await self._pause(pause, cancel)
@@ -450,31 +463,41 @@ class Client:
     # ------------------------------------------------------------------ editing and deleting
     async def edit_message(self, entity: Any, message: Any = None, text: Optional[str] = None, *, buttons: Any = None,
                            parse_mode: Any = "client", link_preview: bool = True,
-                           formatting_entities: Optional[Iterable[E.MessageEntity]] = None, **_: Any) -> Message:
-        """Edit a message: its text (or caption), and its buttons (none given: none left).  ``entity`` may be the message itself."""
+                           formatting_entities: Optional[Iterable[E.MessageEntity]] = None, quiet: bool = False, paced: bool = False,
+                           **_: Any) -> Message:
+        """Edit a message: its text (or caption), and its buttons (none given: none left).  ``entity`` may be the message itself.
+
+        The progress of a transfer is edited in a way that spares Telegram (see ``bot.flood``): ``quiet`` is one more tick of it, which
+        waits its turn in the chat and is not waited out or repeated when Telegram says to slow down; ``paced`` is a change that has to get
+        through, which waits for the flood to be over and for its turn in the chat."""
         if isinstance(entity, Message):
             chat_id, message_id = entity.chat_id, entity.id
             if text is None:
                 text = message
         else:
             chat_id, message_id = self._chat_id(entity), self._msg_id(message)
+        if self.flood is not None and (quiet or paced):
+            if not quiet:
+                await self.flood.calm()
+            await self.flood.pace(chat_id)
         td_id = to_td_message_id(message_id)
         keyboard = markup(buttons)
         base: Dict[str, Any] = {"chat_id": chat_id, "message_id": td_id, "reply_markup": keyboard}
         if text is None:
-            return Message(await self._call({"@type": "editMessageReplyMarkup", **base}))
+            return Message(await self._call({"@type": "editMessageReplyMarkup", **base}, patient=not quiet))
         key = (chat_id, td_id)
         if self._kinds.get(key) != "caption":
             try:
                 done = await self._call({"@type": "editMessageText", **base, "input_message_content": self.text_content(
-                    text, parse_mode=parse_mode, link_preview=link_preview, entities=formatting_entities)})
+                    text, parse_mode=parse_mode, link_preview=link_preview, entities=formatting_entities)}, patient=not quiet)
                 self._kinds[key] = "text"
                 return Message(done)
             except errors.RPCError as exc:
                 if "no text" not in exc.message.lower():
                     raise
                 self._kinds[key] = "caption"  # a file with a caption: its text is the caption
-        return Message(await self._call({"@type": "editMessageCaption", **base, "caption": self.formatted(text, parse_mode, formatting_entities)}))
+        return Message(await self._call({"@type": "editMessageCaption", **base, "caption": self.formatted(text, parse_mode, formatting_entities)},
+                                        patient=not quiet))
 
     async def delete_messages(self, entity: Any, message_ids: Any, *, revoke: bool = True, _td_ids: Optional[List[int]] = None) -> None:
         items = [message_ids] if isinstance(message_ids, (int, Message)) else list(message_ids)
@@ -568,9 +591,11 @@ class Client:
         """Ask TDLib for a file (or its first ``limit`` bytes) and wait until it is there; TDLib's description of the file after that.
 
         TDLib gives the same answer to every download that ends short of the file, whatever the reason (Telegram asking it to slow down
-        for longer than it will wait, a lost connection ...), and it keeps what had arrived: such a download is started again, a few times,
-        after a pause.  One that was cancelled, or that cannot be downloaded at all, is not."""
-        file_id, delays, tries = int(td_file["id"]), list(DOWNLOAD_RETRY_DELAYS), 1
+        for longer than it will wait, a lost connection ...), and it keeps what had arrived: such a download is started again after a
+        pause that grows while nothing new arrives, and, with ``flood``, not before the flood is over.  It is given up after
+        ``DOWNLOAD_STALLS`` stops in a row without a single new byte; a stop that follows new bytes starts the count again.  One that was
+        cancelled, or that cannot be downloaded at all, is not tried again."""
+        file_id, tries, stalls, best = int(td_file["id"]), 1, 0, 0
         while True:
             try:
                 return await self._download_once(td_file, progress=progress, cancel=cancel, priority=priority, limit=limit)
@@ -581,13 +606,22 @@ class Client:
                     local = (await self._call({"@type": "getFile", "file_id": file_id})).get("local") or {}
                 except errors.RPCError:
                     local = {}
-                if not delays or not local.get("can_be_downloaded", True):
+                have = int(local.get("downloaded_prefix_size") or 0)
+                if have > best:
+                    best, stalls = have, 0
+                else:
+                    stalls += 1
+                if stalls >= DOWNLOAD_STALLS or not local.get("can_be_downloaded", True):
                     if tries > 1:
                         raise errors.RPCError(f"{exc.message} (stopped short {tries} times)", exc.code, exc.request) from exc
                     raise
-                log.warning("download of file %s stopped short (%s of %s bytes had arrived): trying again in %ss",
-                            file_id, local.get("downloaded_prefix_size"), td_file.get("size") or td_file.get("expected_size"), delays[0])
-                await self._pause(delays.pop(0), cancel)
+                delay = DOWNLOAD_RETRY_DELAYS[min(max(stalls - 1, 0), len(DOWNLOAD_RETRY_DELAYS) - 1)]
+                if self.flood is not None:  # that is what Telegram's flood looks like from here: nothing new starts until it is over
+                    self.flood.hit(DOWNLOAD_STOP_FLOOD, transfer=True)
+                    delay = max(delay, self.flood.cooling_left())
+                log.warning("download of file %s stopped short (%s of %s bytes had arrived): trying again in %.0fs",
+                            file_id, have, td_file.get("size") or td_file.get("expected_size"), delay)
+                await self._pause(delay, cancel)
                 tries += 1
 
     async def _download_once(self, td_file: Dict[str, Any], *, progress: Optional[Callable[[int, int], None]],
@@ -669,7 +703,11 @@ class Client:
         except OSError:  # another disk
             shutil.move(path, dest)
         await self.forget_file(td_file)
-        return dest.stat().st_size
+        wrote, exact = dest.stat().st_size, int(td_file.get("size") or 0)
+        if exact and wrote != exact:  # TDLib calls a download complete only when the whole file is there; this makes sure of it
+            dest.unlink(missing_ok=True)
+            raise errors.RPCError(f"{_DOWNLOAD_STOPPED} (only {wrote} of {exact} bytes arrived)", 400, "downloadFile")
+        return wrote
 
     async def download_media(self, message: Message, file: Any = None, *, thumb: Any = None, **_: Any) -> Any:
         """The file of a message (or, with ``thumb``, its preview) as ``bytes`` (``file=bytes``) or saved at a path; ``None`` when

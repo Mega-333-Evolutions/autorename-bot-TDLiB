@@ -1,6 +1,7 @@
 """The question the bot asks once its queue is empty: sort the files it has renamed?  (Yes / No / Send more)"""
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -8,9 +9,10 @@ import pytest
 from bot import app as appmod
 from bot.queue import Job, JobQueue
 from bot.sequence import detect, detect_quality
+from bot.tg import errors
 
-from .appkit import ADMIN_CFG, OWNER, click, data_of, say, send_doc
-from .tgfakes import FakeEvent, dispatch, document_message, flat_buttons
+from .appkit import ADMIN_CFG, OWNER, STRANGER, click, data_of, say, say_formatted, send_doc
+from .tgfakes import FakeCallback, FakeEvent, FakeMessage, dispatch, document_message, flat_buttons
 
 OP = "{n} - One Piece [Dual] 720p @Anime_X_Universe.mkv"
 DELAY = 0.1  # SORT_ASK_DELAY in these tests
@@ -69,9 +71,16 @@ def renaming(ctx):
     return Renaming(ctx)
 
 
+class Text(str):
+    """A text message among the files a test sends (everything else in the list is the name of a file)."""
+
+
 async def feed(ctx, names, uid=OWNER, first_id=100):
     for k, name in enumerate(names):
-        await send_doc(ctx, uid, name, mid=first_id + k)
+        if isinstance(name, Text):
+            await say(ctx, uid, str(name), mid=first_id + k)
+        else:
+            await send_doc(ctx, uid, name, mid=first_id + k)
 
 
 def episodes(numbers):
@@ -420,3 +429,365 @@ async def test_files_that_went_to_different_chats_are_asked_about_separately(ctx
     two = [t for _mid, t, _d in questions(ctx)[1:] if "these 2 files" in t]
     three = [t for _mid, t, _d in questions(ctx)[1:] if "these 3 files" in t]
     assert len(two) == 1 and len(three) == 1 and "in your channel" in three[0] and "in your channel" not in two[0]
+
+
+# ---------------------------------------------------------------------------
+# text messages among the files: "include the non-media messages in the sort as well?"
+# ---------------------------------------------------------------------------
+
+HEADING = "Goat Island Arc\n\n🔊 Audio - Dual Audio"
+
+
+async def send_text(ctx, text, mid, uid=OWNER, ago=0.0):
+    """A text message the user sent ``ago`` seconds ago (as its date says)."""
+    message = FakeMessage(text, mid=mid, sender=uid)
+    message.date = datetime.now(timezone.utc) - timedelta(seconds=ago)
+    await dispatch(ctx.client, FakeEvent(uid, message=message))
+
+
+@pytest.fixture
+def order(ctx):
+    """What the bot sends out, in the order it goes: ``("file", name)`` for a file sent again and ``("text", text)`` for a message."""
+    log = []
+    send_file, send_message = ctx.client.send_file, ctx.client.send_message
+
+    async def file_out(entity, file, **kw):
+        log.append(("file", file.file.name))
+        return await send_file(entity, file, **kw)
+
+    async def text_out(entity, text="", **kw):
+        log.append(("text", text))
+        return await send_message(entity, text, **kw)
+
+    ctx.client.send_file, ctx.client.send_message = file_out, text_out
+    return log
+
+
+def laid_out(order, *texts):
+    """The episode numbers of the files sent again and the given texts (as they are), in the order they went out."""
+    return [detect(name, "", "filename")[1] if kind == "file" else name for kind, name in order if kind == "file" or name in texts]
+
+
+def texts_data(cb, action):
+    """The callback data of a button (ty or tn) under the question about the text messages, which is what the Yes turned into."""
+    (data,) = [d for d in data_of(cb.edits[-1][1]) if d.split(":")[1] == action]
+    return data
+
+
+async def at_texts_question(ctx, parts):
+    """Send ``parts`` (files and texts), wait for "sort these now?" and answer Yes: the callback it was answered by."""
+    await feed(ctx, parts)
+    await until(lambda: questions(ctx))
+    return await click(ctx, OWNER, answer_data(ctx, "y"), msg_id=questions(ctx)[0][0])
+
+
+SCENE = episodes((134, 135)) + [Text(HEADING)] + episodes((136,))  # 0134, 0135, a heading, 0136: the heading is between 0135 and 0136
+
+
+async def test_yes_asks_about_the_text_messages_when_one_was_sent_among_the_files(ctx, renaming):
+    await feed(ctx, SCENE)
+    await until(lambda: questions(ctx))
+    (prompt_id, _text, _data) = questions(ctx)[0]
+
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"), msg_id=prompt_id)
+    question, buttons = cb.edits[-1]
+    assert "include the non-media messages in the sort as well?" in question and "“Goat Island Arc”" in question
+    assert [(label, data.split(":")[1]) for label, data in flat_buttons(buttons)] == [("✅ Yes", "ty"), ("❌ No", "tn")]
+    assert not cb.deleted and ctx.client.files == []  # the question turns into the next one; nothing is sorted before that is answered
+    batch = ctx.app.sort_batches[(OWNER, OWNER)]
+    assert batch.prompt_id == prompt_id and len(batch.items) == 3 and [n.text for n in batch.texts] == [HEADING]
+    await quiet()
+    assert len(questions(ctx)) == 1  # and the bot does not ask anything else by itself
+
+
+async def test_yes_to_the_texts_puts_each_one_between_the_same_two_episodes(ctx, renaming, order):
+    cb = await at_texts_question(ctx, SCENE)
+    cb = await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert cb.deleted is True and cb.alerts == []  # the question is taken down once it is answered
+    assert laid_out(order, HEADING) == [134, 135, HEADING, 136]  # between 0135 and 0136, where it was sent
+    (report,) = reports(ctx)
+    assert "Sorted 3 files" in report and "📝 1 text message" in report
+    assert ctx.app.sort_batches == {} and OWNER not in ctx.app._sorting
+
+
+async def test_the_text_is_sent_to_the_chat_the_files_go_to_as_a_message_of_its_own(ctx, renaming, order):
+    cb = await at_texts_question(ctx, SCENE)
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    ((entity, text, kw),) = [m for m in ctx.client.sent if m[1] == HEADING]
+    assert entity == OWNER and kw["link_preview"] is False and "reply_to" not in kw
+
+
+async def test_a_text_follows_the_file_that_was_sent_before_it_wherever_the_sort_puts_that_file(ctx, renaming, order):
+    cb = await at_texts_question(ctx, episodes((136, 134)) + [Text("Arc")] + episodes((135,)))  # sent: 136, 134, "Arc", 135
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert laid_out(order, "Arc") == [134, "Arc", 135, 136]
+
+
+async def test_no_to_the_texts_sorts_just_the_files(ctx, renaming, order):
+    cb = await at_texts_question(ctx, SCENE)
+    cb = await click(ctx, OWNER, texts_data(cb, "tn"))
+    assert cb.deleted is True and cb.alerts == []
+    assert laid_out(order, HEADING) == [134, 135, 136]  # the files are sorted, the text is left out
+    (report,) = reports(ctx)
+    assert "Sorted 3 files" in report and "📝" not in report
+    assert ctx.app.sort_batches == {}
+
+
+async def test_texts_that_were_asked_about_are_not_asked_about_again(ctx, renaming):
+    cb = await at_texts_question(ctx, SCENE)
+    await click(ctx, OWNER, texts_data(cb, "tn"))
+    assert not ctx.app._notes.get(OWNER)
+
+    await feed(ctx, episodes((137, 138)), first_id=200)  # the next batch: the heading is not part of it
+    await until(lambda: len(questions(ctx)) == 2)
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    assert cb.deleted is True and len(ctx.client.files) == 5  # no question about texts: it sorted at once
+
+
+async def test_a_text_sent_with_the_files_is_not_asked_about_if_the_files_are_not_sorted(ctx, renaming):
+    await feed(ctx, SCENE)
+    await until(lambda: questions(ctx))
+    await click(ctx, OWNER, answer_data(ctx, "n"))
+    assert not ctx.app._notes.get(OWNER)  # (the "No" took the files and their texts out of the way)
+
+    await feed(ctx, episodes((137, 138)), first_id=200)
+    await until(lambda: len(questions(ctx)) == 2)
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    assert cb.deleted is True and len(ctx.client.files) == 2
+
+
+async def test_send_more_keeps_the_texts_for_the_next_question(ctx, renaming, order):
+    await feed(ctx, SCENE)
+    await until(lambda: questions(ctx))
+    await click(ctx, OWNER, answer_data(ctx, "m"))
+    await feed(ctx, episodes((137, 138)), first_id=200)
+    await until(lambda: len(questions(ctx)) == 2)
+    cb = await click(ctx, OWNER, answer_data(ctx, "y", which=1))
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert laid_out(order, HEADING) == [134, 135, HEADING, 136, 137, 138]
+
+
+async def test_no_question_about_texts_when_none_was_sent_among_the_files(ctx, renaming, order):
+    await feed(ctx, episodes((134, 135, 136)))
+    await until(lambda: questions(ctx))
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    assert cb.deleted is True and len(ctx.client.files) == 3 and "📝" not in reports(ctx)[0]
+
+
+async def test_a_text_sent_long_before_the_files_is_not_asked_about(ctx, renaming, order):
+    await send_text(ctx, "hello from yesterday", 50, ago=3600)
+    await feed(ctx, episodes((1, 2, 3)))
+    await until(lambda: questions(ctx))
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    assert cb.deleted is True and len(ctx.client.files) == 3 and ("text", "hello from yesterday") not in order
+
+
+async def test_a_heading_sent_together_with_the_files_goes_first_or_last_when_it_is_before_the_first_or_after_the_last(ctx, renaming, order):
+    cb = await at_texts_question(ctx, [Text("Romance Dawn Arc")] + episodes((1, 2)) + [Text("To be continued")])
+    assert [n.text for n in ctx.app.sort_batches[(OWNER, OWNER)].texts] == ["Romance Dawn Arc", "To be continued"]
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert laid_out(order, "Romance Dawn Arc", "To be continued") == ["Romance Dawn Arc", 1, 2, "To be continued"]
+
+
+async def test_texts_of_other_users_are_not_part_of_somebody_elses_sort(ctx, renaming):
+    await feed(ctx, episodes((1,)))
+    await say(ctx, ADMIN_CFG, "not yours", mid=101)
+    await feed(ctx, episodes((2, 3)), first_id=102)
+    await until(lambda: questions(ctx))
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    assert cb.deleted is True and len(ctx.client.files) == 3  # no question: nothing of the owner's is among the files
+
+
+async def test_the_text_is_sent_again_with_its_formatting(ctx, renaming):
+    await feed(ctx, episodes((134,)))
+    await say_formatted(ctx, OWNER, "[b]Goat Island Arc[/b]\n[a=https://x.io]Audio[/a]", mid=101)
+    await feed(ctx, episodes((135,)), first_id=102)
+    await until(lambda: questions(ctx))
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    ((_entity, _text, kw),) = [m for m in ctx.client.sent if m[1].startswith("Goat Island Arc")]
+    assert kw["parse_mode"] is None  # the text is sent as it is, not read for tags
+    assert [type(e).__name__ for e in kw["formatting_entities"]] == ["MessageEntityBold", "MessageEntityTextUrl"]
+
+
+async def test_a_text_telegram_does_not_take_with_its_formatting_goes_out_without_it(ctx, renaming):
+    real = ctx.client.send_message
+
+    async def refusing(entity, text="", **kw):
+        if text.startswith("Goat") and kw.get("formatting_entities"):
+            raise errors.RPCError("ENTITY_BOUNDS_INVALID", 400)
+        return await real(entity, text, **kw)
+
+    ctx.client.send_message = refusing
+    await feed(ctx, episodes((134,)))
+    await say_formatted(ctx, OWNER, "[b]Goat Island Arc[/b]", mid=101)
+    await feed(ctx, episodes((135,)), first_id=102)
+    await until(lambda: questions(ctx))
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    ((_entity, text, kw),) = [m for m in ctx.client.sent if m[1].startswith("Goat")]
+    assert text == "Goat Island Arc" and not kw.get("formatting_entities")
+    assert "📝 1 text message" in reports(ctx)[0]
+
+
+async def test_a_flood_wait_on_a_text_stops_the_sort_and_the_report_lists_what_was_left(ctx, renaming):
+    real = ctx.client.send_message
+
+    async def flooded(entity, text="", **kw):
+        if text.startswith("Goat"):
+            raise errors.FloodWaitError(3600)
+        return await real(entity, text, **kw)
+
+    ctx.client.send_message = flooded
+    cb = await at_texts_question(ctx, SCENE)
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    (report,) = reports(ctx)
+    assert "Sorted 2 of 3 files" in report and "📝 0 of 1 text messages" in report and "Telegram asked me to wait" in report
+    assert "Couldn't be sent" in report and "Goat Island Arc" in report and "136" in report
+    assert len(ctx.client.files) == 2 and OWNER not in ctx.app._sorting
+
+
+async def test_a_text_that_cannot_be_sent_is_reported_and_the_sort_goes_on(ctx, renaming, order):
+    real = ctx.client.send_message
+
+    async def refusing(entity, text="", **kw):
+        if text.startswith("Goat"):
+            raise errors.RPCError("CHAT_WRITE_FORBIDDEN", 403)
+        return await real(entity, text, **kw)
+
+    ctx.client.send_message = refusing
+    cb = await at_texts_question(ctx, SCENE)
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    (report,) = reports(ctx)
+    assert "Sorted 3 files" in report and "📝 0 of 1 text messages" in report and "Couldn't be sent" in report and "Goat Island Arc" in report
+    assert laid_out(order) == [134, 135, 136]
+
+
+async def test_the_texts_go_to_the_channel_the_files_went_to(ctx, renaming):
+    channel = -1001234567890
+    await ctx.db.update_settings(OWNER, target_channel=channel)
+    cb = await at_texts_question(ctx, episodes((1,)) + [Text("Arc")] + episodes((2,)))
+    assert "include the non-media messages" in cb.edits[-1][0]  # asked in the chat with the bot
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert [(entity, text) for entity, text, _kw in ctx.client.sent if text == "Arc"] == [(channel, "Arc")]
+    assert [e for e, _f, _kw in ctx.client.files] == [channel, channel]
+
+
+async def test_files_sent_while_the_question_about_the_texts_is_open_count_as_send_more(ctx, renaming, order):
+    cb = await at_texts_question(ctx, SCENE)
+    (prompt_id, _text, _data) = questions(ctx)[0]
+    old_yes = texts_data(cb, "ty")
+
+    await feed(ctx, episodes((137, 138)), first_id=200)  # no answer, more files instead
+    await until(lambda: ctx.client.deleted)
+    assert ctx.client.deleted == [(OWNER, [prompt_id])] and ctx.app.sort_batches[(OWNER, OWNER)].texts == []
+    await until(lambda: len(questions(ctx)) == 2)
+    assert "sort these 5 files now?" in questions(ctx)[1][1]
+    assert (await click(ctx, OWNER, old_yes)).alerts == ["That question is over."] and ctx.client.files == []
+
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"))  # the question comes back, and so does the one about the texts
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert laid_out(order, HEADING) == [134, 135, HEADING, 136, 137, 138]
+
+
+async def test_the_first_question_cannot_be_answered_again_once_it_has_turned_into_the_second(ctx, renaming):
+    await feed(ctx, SCENE)
+    await until(lambda: questions(ctx))
+    old = {action: answer_data(ctx, action) for action in "ynm"}
+    await click(ctx, OWNER, old["y"])
+    for action in "ynm":
+        cb = await click(ctx, OWNER, old[action])
+        assert cb.alerts == ["That question is over."]
+    assert ctx.client.files == [] and len(ctx.app.sort_batches[(OWNER, OWNER)].texts) == 1
+
+
+async def test_the_buttons_of_the_texts_question_do_nothing_while_it_is_not_asked(ctx, renaming):
+    await feed(ctx, SCENE)
+    await until(lambda: questions(ctx))
+    token = ctx.app.sort_batches[(OWNER, OWNER)].token
+    for action in ("ty", "tn"):
+        cb = await click(ctx, OWNER, f"so:{action}:{OWNER}:{token}")  # the first question is the open one
+        assert cb.alerts == ["That question is over."]
+    assert ctx.client.files == []
+
+
+async def test_a_question_about_the_texts_that_cannot_be_put_on_the_screen_leaves_the_first_one_as_it_was(ctx, renaming, monkeypatch):
+    await feed(ctx, SCENE)
+    await until(lambda: questions(ctx))
+    (prompt_id, _text, _data) = questions(ctx)[0]
+    batch = ctx.app.sort_batches[(OWNER, OWNER)]
+    token = batch.token
+    refuse = {"on": True}
+    edit = FakeCallback.edit
+
+    async def edit_if_it_can(self, *args, **kwargs):
+        if refuse["on"]:
+            raise ConnectionError("offline")
+        return await edit(self, *args, **kwargs)
+
+    monkeypatch.setattr(FakeCallback, "edit", edit_if_it_can)
+    await click(ctx, OWNER, answer_data(ctx, "y"), msg_id=prompt_id)
+    assert (batch.token, batch.texts) == (token, []) and ctx.client.files == []  # nothing changed: the first question is still on the screen
+    refuse["on"] = False
+    cb = await click(ctx, OWNER, answer_data(ctx, "y"), msg_id=prompt_id)  # so its buttons must still work
+    assert "include the non-media messages in the sort as well?" in cb.edits[-1][0] and cb.alerts == []
+
+
+async def test_the_answer_about_the_texts_waits_while_the_last_sort_is_still_going(ctx, renaming, order):
+    cb = await at_texts_question(ctx, SCENE)
+    yes = texts_data(cb, "ty")
+    ctx.app._sorting[OWNER] = asyncio.Event()  # a /sort is sending files
+    cb = await click(ctx, OWNER, yes)
+    assert cb.alerts == ["I'm still sorting your last batch. /cancel to stop it."] and not cb.deleted
+    assert ctx.client.files == [] and ctx.app.sort_batches[(OWNER, OWNER)].texts
+
+    del ctx.app._sorting[OWNER]
+    await click(ctx, OWNER, yes)
+    assert laid_out(order, HEADING) == [134, 135, HEADING, 136]
+
+
+async def test_the_text_that_is_not_shown_in_full_is_still_sent_in_full(ctx, renaming, order):
+    long_text = "One Piece Special Episodes Collection " + "very long line " * 20
+    cb = await at_texts_question(ctx, episodes((1,)) + [Text(long_text)] + episodes((2,)))
+    assert long_text not in cb.edits[-1][0]  # the question only shows its start ...
+    await click(ctx, OWNER, texts_data(cb, "ty"))
+    assert laid_out(order, long_text) == [1, long_text, 2]  # ... the sort sends all of it
+
+
+# ---- which messages are kept ----
+
+
+async def test_only_plain_text_from_the_users_of_the_bot_is_kept(ctx):
+    await say(ctx, OWNER, "/queue")
+    await say(ctx, STRANGER, "hello", mid=3)
+    await say(ctx, OWNER, "   ", mid=4)
+    await send_doc(ctx, OWNER, OP.format(n=1), mid=5)
+    assert ctx.app._notes == {}
+    await say(ctx, OWNER, "Goat Island Arc", mid=6)
+    assert [(n.id, n.text) for n in ctx.app._notes[OWNER]] == [(6, "Goat Island Arc")]
+
+
+async def test_a_text_is_not_kept_when_a_prompt_is_waiting_for_it(ctx):
+    ctx.app.pending[OWNER] = appmod.Pending(kind="remove", chat_id=OWNER, msg_id=9, back="home", is_photo=False, expires=time.time() + 60)
+    assert ctx.app._is_note(FakeEvent(OWNER, "@SomeChannel, [Group]")) is False
+    await say(ctx, OWNER, "@SomeChannel, [Group]", mid=7)  # the answer to the prompt
+    assert ctx.app._notes == {} and (await ctx.db.get_settings(OWNER))["remove_words"] == ["@SomeChannel", "[Group]"]
+
+
+async def test_the_filter_for_texts_wants_a_private_text_from_a_user_of_the_bot_that_is_not_a_file(ctx):
+    assert ctx.app._is_note(FakeEvent(OWNER, "Goat Island Arc")) is True
+    assert ctx.app._is_note(FakeEvent(STRANGER, "Goat Island Arc")) is False  # (it never gets to the handler: the guard stops strangers; this is the filter's own say)
+    assert ctx.app._is_note(FakeEvent(OWNER, "Goat Island Arc", private=False)) is False  # a group is not a chat with the bot
+    captioned = await send_doc(ctx, OWNER, OP.format(n=1), mid=5, caption="Goat Island Arc")
+    assert ctx.app._is_note(captioned) is False and ctx.app._notes == {}  # the caption of a file is not a text message of its own
+
+
+async def test_only_the_latest_texts_are_kept_and_old_ones_expire(ctx, monkeypatch):
+    monkeypatch.setattr(appmod, "NOTES_KEEP", 3)
+    for k in range(5):
+        await say(ctx, OWNER, f"n{k}", mid=10 + k)
+    assert [n.text for n in ctx.app._notes[OWNER]] == ["n2", "n3", "n4"]
+    await send_text(ctx, "too old", 30, ago=appmod.NOTES_AGE + 10)
+    assert [n.text for n in ctx.app._notes[OWNER]] == ["n2", "n3", "n4"]
+    await send_text(ctx, "a while ago", 31, ago=appmod.NOTES_AGE - 60)
+    assert [n.text for n in ctx.app._notes[OWNER]] == ["n3", "n4", "a while ago"]

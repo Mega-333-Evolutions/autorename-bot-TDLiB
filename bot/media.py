@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .errors import Cancelled, MediaError
-from .utils import esc
+from .utils import esc, human_duration
 
 VIDEO_CONTAINERS = {".mkv", ".mp4", ".m4v", ".mov", ".webm", ".mka"}
 AUDIO_TAG_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".opus"}
@@ -300,6 +300,11 @@ class Plan:
     kept_audio: List[Stream] = field(default_factory=list)
     kept_subtitles: List[Stream] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # what the new file has to hold, so that it can be checked (see check_remux): at least this many tracks of each kind, every track
+    # title that was set as (kind, position among the tracks of that kind, title), and the title and artist of the file itself
+    expect: Dict[str, int] = field(default_factory=dict)
+    titles: List[Tuple[str, int, str]] = field(default_factory=list)
+    tags: Dict[str, str] = field(default_factory=dict)
 
 
 def _stream_title(template: str, stream: Stream, position: int) -> str:
@@ -330,12 +335,15 @@ def build_plan(info: MediaInfo, settings: Dict[str, Any], ext: str) -> Optional[
 
     if ext in AUDIO_TAG_EXTS:
         args = ["-map", "0", "-c", "copy", "-map_metadata", "0"]
+        tags: Dict[str, str] = {}
         if meta.get("title"):
             args += ["-metadata", f"title={meta['title']}"]
+            tags["title"] = meta["title"]
         artist = meta.get("artist") or meta.get("author")
         if artist:
             args += ["-metadata", f"artist={artist}"]
-        return Plan(args) if len(args) > 6 else None
+            tags["artist"] = artist
+        return Plan(args, expect={"audio": len(info.audio)}, tags=tags) if len(args) > 6 else None
 
     if ext not in VIDEO_CONTAINERS:
         return None
@@ -372,19 +380,28 @@ def build_plan(info: MediaInfo, settings: Dict[str, Any], ext: str) -> Optional[
         # does when it is only renamed: ffmpeg would pick the muxer from the name, and an MP4 cannot hold SRT subtitles or fonts.
         args += ["-f", real]
 
+    titles: List[Tuple[str, int, str]] = []
+    tags = {}
     for key in ("title", "author", "artist"):
         if meta.get(key):
             args += ["-metadata", f"{key}={meta[key]}"]
+            if key != "author":  # a container may have no place for an author, so that one is not looked for afterwards
+                tags[key] = meta[key]
     if meta.get("video"):
         for j, s in enumerate(out_video):
             if not s.attached_pic:
                 args += [f"-metadata:s:v:{j}", f"title={meta['video']}"]
+                titles.append(("video", j, meta["video"]))
     if meta.get("audio"):
         for j, s in enumerate(sel_a):
-            args += [f"-metadata:s:a:{j}", f"title={_stream_title(meta['audio'], s, j + 1)}"]
+            title = _stream_title(meta["audio"], s, j + 1)
+            args += [f"-metadata:s:a:{j}", f"title={title}"]
+            titles.append(("audio", j, title))
     if meta.get("subtitle"):
         for j, s in enumerate(sel_s):
-            args += [f"-metadata:s:s:{j}", f"title={_stream_title(meta['subtitle'], s, j + 1)}"]
+            title = _stream_title(meta["subtitle"], s, j + 1)
+            args += [f"-metadata:s:s:{j}", f"title={title}"]
+            titles.append(("subtitle", j, title))
 
     if keep_audio and sel_a:
         for j in range(len(sel_a)):
@@ -393,7 +410,8 @@ def build_plan(info: MediaInfo, settings: Dict[str, Any], ext: str) -> Optional[
         for j in range(len(sel_s)):
             args += [f"-disposition:s:{j}", "+default" if j == 0 else "-default"]
 
-    return Plan(args, kept_audio=sel_a, kept_subtitles=sel_s, warnings=warnings)
+    expect = {"video": len(info.video), "audio": len(sel_a), "subtitle": len(sel_s)}
+    return Plan(args, kept_audio=sel_a, kept_subtitles=sel_s, warnings=warnings, expect=expect, titles=titles, tags=tags)
 
 
 async def apply_plan(src: Path, dst: Path, plan: Plan, cancel: Optional[asyncio.Event] = None) -> None:
@@ -406,23 +424,57 @@ async def apply_plan(src: Path, dst: Path, plan: Plan, cancel: Optional[asyncio.
         raise MediaError("ffmpeg failed: " + err.decode("utf-8", "replace").strip()[-500:])
 
 
+def count_tracks(info: MediaInfo) -> str:
+    """``1 video · 2 audio · 3 subtitles``: the tracks of a file, for the line that says what was checked."""
+    kinds = ((len(info.video), "video"), (len(info.audio), "audio"), (len(info.subtitles), "subtitles"))
+    return " · ".join(f"{count} {label}" for count, label in kinds if count)
+
+
+def check_remux(source: MediaInfo, plan: Plan, result: MediaInfo, size: int) -> Tuple[List[str], List[str]]:
+    """Look at the file ffmpeg made from ``source``: ``(problems, notes)``.
+
+    A problem means the file is not what was asked for and should not be sent: it is empty, a track did not come through, or it is
+    shorter than the original.  A note is something that did not come through but harms nothing (a title), which the user should hear of."""
+    if size <= 0:
+        return ["the new file is empty"], []
+    problems: List[str] = []
+    notes: List[str] = []
+    for kind, wanted in plan.expect.items():
+        found = len(result.video if kind == "video" else result.of(kind))
+        if found < wanted:
+            problems.append(f"only {found} of {wanted} {kind} tracks came through")
+    if source.duration > 0 and result.duration > 0 and result.duration < source.duration - max(2.0, source.duration * 0.02):
+        problems.append(f"the new file is {human_duration(result.duration)} long, the original {human_duration(source.duration)}")
+    for kind, position, title in plan.titles:
+        tracks = result.of(kind)
+        if position >= len(tracks) or tracks[position].title.strip() != title.strip():
+            notes.append(f"The title of {kind} track {position + 1} was not applied.")
+    for key, value in plan.tags.items():
+        if (result.tags.get(key) or "").strip() != value.strip():
+            notes.append(f"The {key} was not applied.")
+    return problems, notes
+
+
 # ---------------------------------------------------------------------------
 # thumbnails
 # ---------------------------------------------------------------------------
 
 
 async def make_video_thumbnail(src: Path, dst: Path, duration: float, cancel: Optional[asyncio.Event] = None) -> bool:
-    """Grab a frame (~10% in) as a small JPEG.  Failure is non-fatal."""
-    seek = 1.0 if duration <= 0 else min(max(duration * 0.1, 0.0), 60.0)
-    cmd = [
-        "ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-ss", f"{seek:.2f}", "-i", str(src),
-        "-frames:v", "1", "-vf", "scale='min(320,iw)':-2", "-q:v", "4", str(dst),
-    ]
-    try:
-        code, _o, _e = await _run(cmd, cancel)
-    except MediaError:
-        return False
-    return code == 0 and dst.exists() and dst.stat().st_size > 0
+    """Grab a frame (~10% in) as a small JPEG; when there is none there (a file that is cut off), one nearer the start.  Failure is non-fatal."""
+    for seek in frame_seeks(duration):
+        dst.unlink(missing_ok=True)
+        cmd = [
+            "ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-ss", f"{seek:.2f}", "-i", str(src),
+            "-frames:v", "1", "-vf", "scale='min(320,iw)':-2", "-q:v", "4", str(dst),
+        ]
+        try:
+            code, _o, _e = await _run(cmd, cancel)
+        except MediaError:
+            return False
+        if code == 0 and dst.exists() and dst.stat().st_size > 0:
+            return True
+    return False
 
 
 def frame_seeks(duration: float) -> List[float]:

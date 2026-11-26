@@ -687,13 +687,36 @@ async def test_a_download_that_stops_short_is_started_again_after_a_pause(td, tg
     assert "stopped short" in caplog.text and tg._watchers == {}
 
 
-async def test_a_download_that_keeps_stopping_short_is_given_up_after_the_last_try(td, tg, tmp_path, slept):
+async def test_a_download_that_keeps_stopping_short_without_a_new_byte_is_given_up_after_eight_stops(td, tg, tmp_path, slept):
     td.reply("downloadFile", error(400, STOPPED))
     with pytest.raises(errors.RPCError) as caught:
         await tg.download_to(incoming(), tmp_path / "src")
-    assert STOPPED in caught.value.message and "4 times" in caught.value.message and caught.value.code == 400
-    assert len(td.calls("downloadFile")) == 4 and [wait for wait in slept if wait] == [5.0, 15.0, 30.0]
+    assert STOPPED in caught.value.message and "8 times" in caught.value.message and caught.value.code == 400
+    assert len(td.calls("downloadFile")) == 8 and [wait for wait in slept if wait] == [5.0, 15.0, 30.0, 60.0, 60.0, 60.0, 60.0]
     assert tg._watchers == {}
+
+
+async def test_a_download_that_gains_bytes_between_its_stops_is_never_given_up(td, tg, tmp_path, slept):
+    kept = tmp_path / "td" / "file.bin"
+    kept.parent.mkdir()
+    kept.write_bytes(b"x" * 100)
+    arrived = iter(range(1, 100))
+    td.reply("downloadFile", *([error(400, STOPPED)] * 20), td_file(7, 100, path=str(kept), completed=True))
+    td.reply("getFile", lambda _request: td_file(7, 100, downloaded=next(arrived)))  # a byte more each time: 20 stops in a row, none fruitless
+    wrote = await tg.download_to(incoming(), tmp_path / "work" / "src.mkv")
+    assert wrote == 100 and len(td.calls("downloadFile")) == 21 and [wait for wait in slept if wait] == [5.0] * 20
+
+
+async def test_the_count_of_fruitless_stops_starts_again_when_bytes_arrive(td, tg, tmp_path, slept):
+    kept = tmp_path / "td" / "file.bin"
+    kept.parent.mkdir()
+    kept.write_bytes(b"x" * 100)
+    prefixes = iter([0] * 6 + [50] + [50] * 6)  # six stops without a byte, one with, six without again: never eight in a row
+    td.reply("downloadFile", *([error(400, STOPPED)] * 13), td_file(7, 100, path=str(kept), completed=True))
+    td.reply("getFile", lambda _request: td_file(7, 100, downloaded=next(prefixes)))
+    await tg.download_to(incoming(), tmp_path / "work" / "src.mkv")
+    assert len(td.calls("downloadFile")) == 14
+    assert [wait for wait in slept if wait] == [5.0, 15.0, 30.0, 60.0, 60.0, 60.0, 5.0, 5.0, 15.0, 30.0, 60.0, 60.0, 60.0]
 
 
 async def test_a_download_that_stopped_because_the_job_was_cancelled_is_not_started_again(td, tg, tmp_path, slept):

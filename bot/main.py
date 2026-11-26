@@ -13,6 +13,7 @@ from typing import Awaitable, Callable
 from . import __version__, errorlog, sysinfo, tdstate
 from .config import Config, ConfigError, load_config
 from .db import Database
+from .flood import FloodControl
 from .tg import Client
 
 log = logging.getLogger("bot")
@@ -74,7 +75,8 @@ async def _stop_quietly(td) -> None:
 
 async def start_client(cfg: Config) -> Client:
     td = make_td(cfg)
-    client = Client(td, tmp_dir=Path(cfg.temp_dir) / "send", bot_dc=cfg.bot_dc)
+    flood = FloodControl(uploads=cfg.max_uploads, downloads=cfg.max_downloads)  # one for the whole bot: the limits are per IP address
+    client = Client(td, tmp_dir=Path(cfg.temp_dir) / "send", bot_dc=cfg.bot_dc, flood=flood)
     try:
         await login(td)
     except BaseException:

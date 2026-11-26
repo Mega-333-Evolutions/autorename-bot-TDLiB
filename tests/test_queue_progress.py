@@ -445,3 +445,232 @@ async def test_reporter_finish_removes_buttons():
     r = ProgressReporter(client, None, 1, "x")
     await r.finish("✅ Done")
     assert client.edits[-1] == ("✅ Done", None)
+
+
+# ---------------------------------------------------------------------------
+# progress reporter with a flood control
+# ---------------------------------------------------------------------------
+
+
+class FloodClient(FakeClient):
+    """A client that has a flood control: it is told how each edit wants to be treated."""
+
+    def __init__(self, flood):
+        super().__init__()
+        self.flood = flood
+        self.flags = []
+
+    async def edit_message(self, message, text, buttons=None, parse_mode=None, quiet=False, paced=False):
+        self.flags.append((quiet, paced))
+        await super().edit_message(message, text, buttons=buttons, parse_mode=parse_mode)
+
+
+def flooded(now=None):
+    from bot.flood import FloodControl
+
+    now = now if now is not None else [0.0]
+    return FloodControl(clock=lambda: now[0]), now
+
+
+CHAT = SimpleNamespace(id=1, chat_id=5)
+
+
+async def test_with_a_flood_control_ticks_are_quiet_and_the_stages_and_the_end_have_to_get_through():
+    flood, _now = flooded()
+    client = FloodClient(flood)
+    r = ProgressReporter(client, CHAT, 7, "x", interval=0)
+    r.set_stage("⬇️ Downloading", 100)
+    await asyncio.sleep(0.02)
+    r._last_edit = 0.0  # (a message is edited at most every 2.5 s, whatever the interval is set to)
+    r(50, 100)
+    await asyncio.sleep(0.02)
+    await r.finish("✅ Done")
+    assert client.flags == [(False, True), (True, False), (False, True)]
+
+
+async def test_ticks_are_left_out_while_a_flood_is_on_and_a_stage_change_is_not():
+    flood, now = flooded()
+    client = FloodClient(flood)
+    r = ProgressReporter(client, CHAT, 7, "x", interval=0)
+    r.set_stage("⬇️ Downloading", 100)
+    await asyncio.sleep(0.02)
+    flood.hit(3)
+    r(30, 100)
+    r(100, 100)  # not even the last one: the next stage shows where the file is
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 1
+    r.set_stage("⬆️ Uploading", 100)
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 2 and "Uploading" in client.edits[-1][0]
+    now[0] = 10.0  # the flood is over
+    r._last_edit = 0.0
+    r(60, 100)
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 3 and "60.0%" in client.edits[-1][0]
+
+
+async def test_the_interval_grows_with_the_number_of_progress_messages_in_the_chat():
+    flood, _now = flooded()
+    client = FloodClient(flood)
+    reporters = [ProgressReporter(client, CHAT, n, "x", interval=4) for n in range(3)]
+    r = reporters[0]
+    r.set_stage("⬇️ Downloading", 100)
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 1
+    r._last_edit = time.monotonic() - 6  # six seconds since the last edit: enough for 4 s, not for three messages sharing the chat
+    r(10, 100)
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 1
+    await reporters[2].finish("✅ Done")  # two share it now: every 5 s
+    n_before = len(client.edits)
+    r(11, 100)
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == n_before + 1
+
+
+async def test_a_reporter_is_let_go_by_the_chat_when_it_finishes():
+    flood, _now = flooded()
+    r = ProgressReporter(FloodClient(flood), CHAT, 7, "x")
+    assert len(flood._watching[5]) == 1
+    await r.finish("✅ Done")
+    assert 5 not in flood._watching
+
+
+async def test_a_reporter_without_a_chat_or_a_flood_control_is_not_watched():
+    flood, _now = flooded()
+    ProgressReporter(FloodClient(flood), None, 7, "x")
+    ProgressReporter(FakeClient(), CHAT, 7, "x")
+    assert flood._watching == {}
+
+
+async def test_a_tick_that_would_not_change_the_message_is_left_out():
+    client = FakeClient()
+    r = ProgressReporter(client, None, 1, "x", interval=0)
+    r.set_stage("⬇️ Downloading", 1000)
+    await asyncio.sleep(0.02)
+    r(500, 1000)
+    await asyncio.sleep(0.02)
+    r(500, 1000)
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 2
+    r.set_stage("⬇️ Downloading", 1000)  # a stage change is shown even when the text is the same
+    await asyncio.sleep(0.02)
+    assert len(client.edits) == 3
+
+
+async def test_a_waiting_stage_has_a_note_in_place_of_working_and_keeps_the_cancel_button():
+    client = FakeClient()
+    r = ProgressReporter(client, None, 7, "x", interval=0)
+    r.waiting("⏳ Waiting for a turn", "Other <files> are on their way.")
+    await asyncio.sleep(0.02)
+    text, buttons = client.edits[-1]
+    assert text == "<b>⏳ Waiting for a turn</b>\n<code>x</code>\n\nOther &lt;files&gt; are on their way."
+    assert "Working" not in text and buttons[0][0].type.data == b"job:x:7"
+    r.set_stage("⬇️ Downloading", 0)  # the note is for that stage only
+    await asyncio.sleep(0.02)
+    assert client.edits[-1][0].endswith("Working…")
+
+
+# ---------------------------------------------------------------------------
+# a job given back to be tried again later
+# ---------------------------------------------------------------------------
+
+
+def gives_back_once(delay, log):
+    """A runner that gives each job back (state ``queued``, due ``delay`` seconds from now) the first time it sees it."""
+
+    async def runner(j):
+        log.append((j.id, j.attempts, time.time()))
+        if j.attempts == 0:
+            j.attempts += 1
+            j.retry_at = time.time() + delay
+            j.state = "queued"
+
+    return runner
+
+
+async def test_a_job_the_runner_gives_back_stays_and_is_tried_again_when_it_is_due():
+    seen, left = [], []
+
+    async def on_left(j):
+        left.append(j.id)
+
+    q = JobQueue(gives_back_once(0.2, seen), workers=1, on_left=on_left)
+    q.start()
+    a = job(q)
+    q.add(a)
+    await asyncio.sleep(0.1)
+    assert [(i, n) for i, n, _t in seen] == [(a.id, 0)]
+    assert a.id in q.jobs and q.waiting == 1 and q.running == 0 and left == []  # waiting for its time, and not "left"
+    await asyncio.sleep(0.4)
+    assert [(i, n) for i, n, _t in seen] == [(a.id, 0), (a.id, 1)]
+    assert seen[1][2] - seen[0][2] >= 0.19
+    assert q.jobs == {} and left == [a.id]  # told once, when it was really done
+    await q.stop()
+
+
+async def test_other_jobs_go_first_while_a_job_waits_for_its_time():
+    seen = []
+    q = JobQueue(gives_back_once(0.3, seen), workers=1)
+    q.start()
+    a, b = job(q), job(q)
+    q.add(a)
+    await asyncio.sleep(0.1)
+    q.add(b)  # younger than a, but a is not due
+    await asyncio.sleep(0.1)
+    assert [(i, n) for i, n, _t in seen][:2] == [(a.id, 0), (b.id, 0)]
+    await asyncio.sleep(0.6)
+    assert (a.id, 1) in [(i, n) for i, n, _t in seen] and (b.id, 1) in [(i, n) for i, n, _t in seen]
+    assert q.jobs == {}
+    await q.stop()
+
+
+async def test_a_job_waiting_for_its_time_can_be_cancelled():
+    seen, left, cancelled = [], [], []
+
+    async def on_left(j):
+        left.append(j.id)
+
+    async def on_cancelled(j):
+        cancelled.append(j.id)
+
+    q = JobQueue(gives_back_once(0.3, seen), workers=1, on_cancelled=on_cancelled, on_left=on_left)
+    q.start()
+    a = job(q)
+    q.add(a)
+    await asyncio.sleep(0.1)
+    assert q.cancel(a.id)
+    await asyncio.sleep(0.5)
+    assert [(i, n) for i, n, _t in seen] == [(a.id, 0)] and cancelled == [a.id] and left == [a.id] and q.jobs == {}
+    await q.stop()
+
+
+async def test_a_job_given_back_counts_as_waiting_and_is_still_the_users_job():
+    async def runner(j):
+        j.attempts += 1
+        j.retry_at = time.time() + 30
+        j.state = "queued"
+
+    q = JobQueue(runner, workers=1)
+    q.start()
+    a = job(q)
+    q.add(a)
+    await asyncio.sleep(0.1)
+    assert q.running == 0 and q.waiting == 1 and q.position(a) == 1 and q.for_user(1) == [a]
+    assert q.add(job(q)) == 1  # a new job has it ahead of it
+    await q.stop()
+
+
+async def test_a_job_that_is_not_given_back_is_finished_as_before():
+    seen = []
+
+    async def runner(j):
+        seen.append(j.id)
+
+    q = JobQueue(runner, workers=1)
+    q.start()
+    a = job(q)
+    q.add(a)
+    await asyncio.sleep(0.1)
+    assert seen == [a.id] and a.state == "done" and q.jobs == {} and a.attempts == 0 and a.retry_at == 0.0
+    await q.stop()

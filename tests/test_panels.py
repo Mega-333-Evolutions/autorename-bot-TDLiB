@@ -1,6 +1,7 @@
 import copy
 import html
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -341,3 +342,22 @@ def test_the_answers_to_the_sort_question_say_what_was_decided():
     assert "won't sort these 100 files" in panels.sort_declined(100) and "from now on" in panels.sort_declined(100)
     assert "won't sort this file" in panels.sort_declined(1)
     assert "100 so far" in panels.sort_waits(100) and "ask again" in panels.sort_waits(100)
+
+
+def test_the_question_about_the_text_messages_has_yes_and_no_that_carry_the_chat_and_the_question_number():
+    texts = [SimpleNamespace(text="Goat Island Arc\n\n🔊 Audio - Dual Audio")]
+    text, rows = panels.texts_question(texts, 4242, 9)
+    plain = visible(text)
+    assert "Do you want to include the non-media messages in the sort as well?" in plain
+    assert "a text message along with the files: “Goat Island Arc”." in plain  # the first line of each text is what is shown
+    assert rows == [[("✅ Yes", "so:ty:4242:9"), ("❌ No", "so:tn:4242:9")]]
+    assert all(len(data.encode()) <= 64 for _label, data in panels.texts_question(texts, -1009999999999999, 10 ** 9)[1][0])
+
+
+def test_the_question_about_the_text_messages_shows_a_few_of_them_and_counts_the_rest():
+    many = [SimpleNamespace(text=f"Arc number {n} " + "x" * 80) for n in range(1, 6)]
+    plain = visible(panels.texts_question(many, 1, 1)[0])
+    assert "You sent 5 text messages along with the files" in plain and plain.count("“Arc number") == 3 and "and 2 more" in plain
+    assert "x" * 40 not in plain  # long ones are cut
+    html_text = panels.texts_question([SimpleNamespace(text="<b>&</b> arc")], 1, 1)[0]
+    assert "&lt;b&gt;&amp;&lt;/b&gt; arc" in html_text and "<b>&</b>" not in html_text  # what they say is not read as formatting

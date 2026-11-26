@@ -13,9 +13,10 @@ import time
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import datacenter, errorlog, media, mediainfo, panels, richtext, speed, sysinfo, transfer
+from .batch import REPORT_MIN, Outcome, format_batch
 from .config import Config
 from .db import MAX_FORMATS, Database
 from .dbflow import PREFIX as DBFLOW_PREFIX
@@ -35,7 +36,7 @@ from .formats import (
 from .parser import compute_new_name, missing_variables, parse_caption, parse_info, split_ext
 from .pipeline import PROBE_EXTS, Renamer, embedded_thumb, original_name_of, source_ext
 from .queue import Job, JobQueue
-from .sequence import SeqItem, SequenceState, SortBatch, analyse, format_report
+from .sequence import Note, SeqItem, SequenceState, SortBatch, analyse, format_report, notes_for, place_notes
 from .settings_ops import CLEAR_WORDS, META_COMMANDS, apply_setting, parse_channel, parse_format_channel
 from .telegraph import Telegraph, TelegraphError
 from .tg import Button, errors, events, types
@@ -105,6 +106,9 @@ SORT_SLOW_GAP = 0.8  # about one file a second, what Telegram lets a bot keep se
 SORT_LOOKUP = 100  # files /sort looks up per request (Telegram returns at most 100 messages at a time)
 SORT_MAX_WAIT = 120  # a Telegram flood wait longer than this (seconds) stops /sort instead of being waited out
 SORT_PROGRESS_EVERY = 10  # files between two updates of the "Sorting…" message
+NOTES_KEEP = 300  # text messages kept per user, for the sort to put among their files (the oldest go first)
+NOTES_AGE = 12 * 3600  # seconds a text message is kept
+OUTCOMES_KEEP = 3000  # how many ended files are remembered per user for the report on a batch (the oldest go first)
 TRACKS_PROBE_BYTES = 12 * 1024 * 1024
 TRACKS_FULL_LIMIT = 700 * 1024 * 1024
 SHARE_PREFIX = "fmt_"  # /start fmt_<token> opens a shared format: it is the link on the card the Share format button makes
@@ -192,6 +196,14 @@ def is_playable(message: Any, name: str) -> bool:
     return mime.startswith(("video/", "audio/")) or source_ext(message, name).lower() in PROBE_EXTS
 
 
+def _sent_at(message: Any) -> float:
+    """When a message was sent (seconds since 1970); the time it reached the bot when the message does not say."""
+    date = getattr(message, "date", None)
+    if hasattr(date, "timestamp"):
+        return float((date if date.tzinfo is not None else date.replace(tzinfo=timezone.utc)).timestamp())
+    return time.time()
+
+
 def telegram_facts(message: Any, caption: bool = True) -> Dict[str, str]:
     """What Telegram knows about the file, for the "Telegram" part of the /mediainfo page."""
     date = getattr(message, "date", None)
@@ -234,7 +246,10 @@ class App:
         self._sort_tickets = 0  # counts the questions, so the buttons of an old one are told from the current one's
         self._sort_waiting: Dict[int, int] = {}  # user -> the latest time their queue ran empty; only the wait that began then asks
         self._intake: Dict[int, int] = {}  # user -> files being queued right now (not in the queue yet)
+        self._notes: Dict[int, List[Note]] = {}  # user -> the text messages they sent lately (the sort can put them among the files)
+        self._outcomes: Dict[int, List[Outcome]] = {}  # user -> how their files ended since the last report on a batch
         self.renamer.on_renamed = self._sort_noted
+        self.renamer.on_result = self._note_result
         # uploading a manually renamed episode to the Database Channel (and having it published) needs both chats
         self.dbflow: Optional[DbFlow] = DbFlow(client, cfg) if cfg.upload_enabled else None
         if self.dbflow is not None:
@@ -390,6 +405,7 @@ class App:
         add(self._guard(self.on_media), events.NewMessage(incoming=True, func=lambda e: e.is_private and is_renameable(e.message)))
         add(self._guard(self.on_photo), events.NewMessage(incoming=True, func=lambda e: e.is_private and e.message.photo is not None))
         add(self._guard(self.on_gif), events.NewMessage(incoming=True, func=lambda e: e.is_private and e.message.gif is not None))
+        add(self._guard(self.on_note), events.NewMessage(incoming=True, func=self._is_note))  # (before on_text: it takes a prompt's answer first)
         add(self._guard(self.on_text), events.NewMessage(incoming=True, func=self._wants_text))
         add(self._guard(self.on_callback), events.CallbackQuery())
         add(self._guard_inline(self.on_inline), events.InlineQuery())
@@ -406,6 +422,14 @@ class App:
     def _wants_text(self, e: Any) -> bool:
         text = e.raw_text or ""
         return bool(e.is_private and text and not text.startswith("/") and e.sender_id in self.pending and not e.message.media)
+
+    def _is_note(self, e: Any) -> bool:
+        """A text message from a user of the bot that nothing else asked for: no command, no file, and no prompt waiting for an answer."""
+        text = e.raw_text or ""
+        return bool(
+            e.is_private and text.strip() and not text.startswith("/") and not e.message.media
+            and self.is_allowed(e.sender_id) and e.sender_id not in self.pending
+        )
 
     def _command_table(self) -> Dict[str, Callable[[Any], Awaitable[None]]]:
         table: Dict[str, Callable[[Any], Awaitable[None]]] = {
@@ -850,9 +874,35 @@ class App:
         self._end_mode(uid)
         await self._sort_files(uid, chat_id, chat_id, state.items, state.status_id)
 
-    async def _sort_files(self, uid: int, home: int, chat_id: int, items: List[SeqItem], status_id: Optional[int] = None) -> None:
+    async def _send_text_back(self, chat_id: int, note: Note) -> None:
+        """Send one text message again, with its formatting (without it when Telegram does not take that)."""
+        for attempt in range(3):
+            try:
+                try:
+                    await self.client.send_message(chat_id, note.text, formatting_entities=note.entities, parse_mode=None, link_preview=False)
+                except errors.FloodWaitError:
+                    raise
+                except errors.RPCError:
+                    if not note.entities:
+                        raise
+                    await self.client.send_message(chat_id, note.text, parse_mode=None, link_preview=False)
+                return
+            except errors.FloodWaitError as exc:
+                if attempt == 2 or exc.seconds > SORT_MAX_WAIT:
+                    raise
+                await self._pause(exc.seconds + 1)
+
+    @staticmethod
+    def _text_item(note: Note) -> SeqItem:
+        """A text message that could not be sent, as a line of the report."""
+        return SeqItem(msg_id=note.id, name=((note.text or "").strip().splitlines() or [""])[0])
+
+    async def _sort_files(
+        self, uid: int, home: int, chat_id: int, items: List[SeqItem], status_id: Optional[int] = None, notes: Sequence[Note] = (),
+    ) -> None:
         """Send ``items`` (files in ``chat_id``) again in episode order, then the report.  What the bot says about it goes to ``home``, the
-        chat with the user; the files go back to ``chat_id``, the same chat unless they were sent to the user's channel."""
+        chat with the user; the files go back to ``chat_id``, the same chat unless they were sent to the user's channel.  ``notes``: text
+        messages that go out again too, each one right after the file that was sent before it."""
         say = lambda text, **kw: self.client.send_message(home, text, parse_mode="html", link_preview=False, **kw)  # noqa: E731
         cancel = self._sorting[uid] = asyncio.Event()
         total = len(items)
@@ -862,35 +912,48 @@ class App:
                 await self._delete_quietly(home, status_id)
             s = await self.db.get_settings(uid)
             plan = analyse(items, s["mode"])
-            status = await say(f"🔢 <b>Sorting {total} file{'s' if total != 1 else ''}…</b>")
+            lines = place_notes(plan.ordered, notes) if notes else plan.ordered  # the files in order, the texts among them
+            also = f" and {len(notes)} text message{'s' if len(notes) != 1 else ''}" if notes else ""
+            status = await say(f"🔢 <b>Sorting {total} file{'s' if total != 1 else ''}{also}…</b>")
 
             sent = 0
+            placed = 0  # text messages sent
             failed: List[SeqItem] = []
             note = ""
             stopped = False
             found: List[Any] = []  # the messages of the files being sent, looked up SORT_LOOKUP at a time as the sort goes
-            for index, item in enumerate(plan.ordered):
+            position = -1  # of the file being sent, among the files
+            for index, item in enumerate(lines):
                 if cancel.is_set():
                     stopped = True
                     break
-                if index % SORT_LOOKUP == 0:
-                    found = await self._look_up(chat_id, plan.ordered[index:index + SORT_LOOKUP])
-                msg = found[index % SORT_LOOKUP]
-                if msg is None or getattr(msg, "file", None) is None:  # deleted since it was sent
-                    failed.append(item)
-                    continue
+                is_text = isinstance(item, Note)
+                if not is_text:
+                    position += 1
+                    if position % SORT_LOOKUP == 0:
+                        found = await self._look_up(chat_id, plan.ordered[position:position + SORT_LOOKUP])
+                    msg = found[position % SORT_LOOKUP]
+                    if msg is None or getattr(msg, "file", None) is None:  # deleted since it was sent
+                        failed.append(item)
+                        continue
                 try:
-                    await self._send_back(chat_id, msg)
+                    if is_text:
+                        await self._send_text_back(chat_id, item)
+                    else:
+                        await self._send_back(chat_id, msg)
                 except errors.FloodWaitError as exc:
                     note = f"⚠️ Telegram asked me to wait {human_uptime(exc.seconds)} before sending more, so I stopped here."
-                    failed.extend(plan.ordered[index:])
+                    failed.extend(self._text_item(n) if isinstance(n, Note) else n for n in lines[index:])
                     break
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("could not send %s back: %s", item.name, exc)
-                    failed.append(item)
+                    log.warning("could not send %s back: %s", self._text_item(item).name if is_text else item.name, exc)
+                    failed.append(self._text_item(item) if is_text else item)
                     continue
-                sent += 1
-                if sent % SORT_PROGRESS_EVERY == 0 and sent < total:
+                if is_text:
+                    placed += 1
+                else:
+                    sent += 1
+                if not is_text and sent % SORT_PROGRESS_EVERY == 0 and sent < total:
                     try:
                         await self.client.edit_message(status, f"🔢 <b>Sorting…</b> {sent} of {total} sent", parse_mode="html")
                     except Exception:  # noqa: BLE001
@@ -903,7 +966,7 @@ class App:
             if stopped:
                 await say(f"⏹ Stopped after {sent} of {total} file{'s' if total != 1 else ''}.")
                 return
-            for chunk in format_report(plan, total, sent, failed, note):
+            for chunk in format_report(plan, total, sent, failed, note, texts=(placed, len(notes)) if notes else None):
                 await say(chunk)
         finally:
             self._sorting.pop(uid, None)
@@ -948,7 +1011,7 @@ class App:
             )
         job = Job(
             id=self.queue.new_id(), user_id=uid, chat_id=event.chat_id, msg_id=msg.id,
-            file_name=orig, size=size, new_name=new_name, fmt=fmt, notes=notes, order=event.id,
+            file_name=orig, size=size, new_name=new_name, fmt=fmt, notes=notes, order=event.id, sent_at=_sent_at(msg),
         )
         ahead = self.queue.running + self.queue.waiting
         where = "starting soon" if ahead == 0 else f"{ahead} ahead of it"
@@ -970,6 +1033,7 @@ class App:
     # The files the bot renames with the auto settings are noted per user and chat.  Once the user's queue has stayed empty for a moment
     # the bot asks whether to sort them (what /sort does).  Yes: sorted and sent.  No: forgotten, so the next question is only about
     # files sent after it.  Send more, or more files sent while the question is open: they are kept, and the next question is about all.
+    # Just before the question (alone, when there is nothing to sort) the bot says how the batch went: see batch.py.
     def _queue_busy(self, uid: int) -> bool:
         """Has the user a file queued, being renamed, or on its way into the queue?"""
         return bool(self.queue.for_user(uid)) or uid in self._intake
@@ -983,13 +1047,49 @@ class App:
             batch.version += 1
             if batch.prompt_id is not None:
                 self._spawn(self._delete_quietly(batch.home, batch.prompt_id))
-            batch.prompt_id, batch.token = None, 0
+            batch.prompt_id, batch.token, batch.texts = None, 0, []
+
+    async def on_note(self, event: Any) -> None:
+        """Remember a text message (a heading forwarded between the episodes, say): when the renamed files are sorted, the bot offers to put
+        the ones that were sent among them in their places.  Nothing is said now."""
+        notes = self._notes.setdefault(event.sender_id, [])
+        notes.append(Note(id=event.id, text=event.raw_text, entities=list(getattr(event.message, "entities", None) or []), date=_sent_at(event.message)))
+        old = time.time() - NOTES_AGE
+        notes[:] = [n for n in notes if n.date >= old][-NOTES_KEEP:]
+
+    def _texts_for(self, uid: int, batch: SortBatch) -> List[Note]:
+        """The text messages the user sent along with the files of this batch."""
+        return notes_for(batch.items, self._notes.get(uid, []))
+
+    def _texts_done(self, uid: int, texts: List[Note]) -> None:
+        """Texts that were asked about (or that go with files nobody wants sorted) are not asked about again."""
+        gone = {n.id for n in texts}
+        if gone and uid in self._notes:
+            self._notes[uid] = [n for n in self._notes[uid] if n.id not in gone]
 
     async def _sort_noted(self, job: Job, chat: int, sent: Any) -> None:
         """A file renamed with the auto settings is in its chat: it joins the files asked about when the queue is empty."""
         batch = self.sort_batches.setdefault((job.user_id, chat), SortBatch(home=job.chat_id))
-        batch.items.append(SeqItem(msg_id=sent.id, name=job.new_name, caption=getattr(sent, "raw_text", None) or ""))
+        batch.items.append(SeqItem(msg_id=sent.id, name=job.new_name, caption=getattr(sent, "raw_text", None) or "",
+                                   source_id=job.msg_id, sent_at=job.sent_at))
         batch.version += 1
+
+    async def _note_result(self, job: Job, result: Any) -> None:
+        """A file is finished for good (renamed, failed or cancelled): it is counted in the report on the batch."""
+        outcomes = self._outcomes.setdefault(job.user_id, [])
+        outcomes.append(Outcome.of(job, result))
+        del outcomes[:-OUTCOMES_KEEP]
+
+    async def _report_batch(self, uid: int) -> None:
+        """The user's queue is empty: say how the batch went.  Only for several files (one file's own message says it all), and only
+        once: the files that come after it are the next batch."""
+        outcomes = self._outcomes.pop(uid, [])
+        if len(outcomes) < REPORT_MIN:
+            return
+        try:
+            await self.client.send_message(outcomes[-1].chat_id, format_batch(outcomes), parse_mode="html")
+        except Exception:  # noqa: BLE001 - the question about sorting is still asked
+            log.exception("could not send the report on the batch")
 
     async def _on_job_left(self, job: Job) -> None:
         self._sort_arm(job.user_id)
@@ -997,8 +1097,8 @@ class App:
     def _sort_arm(self, uid: int) -> None:
         """The user's queue may be empty now: ask about their renamed files once it has stayed empty for a moment.  Only the last call
         gets the question asked, so a job that finishes soon after pushes it back."""
-        if not any(owner == uid and batch.items for (owner, _chat), batch in self.sort_batches.items()):
-            return
+        if not self._outcomes.get(uid) and not any(owner == uid and batch.items for (owner, _chat), batch in self.sort_batches.items()):
+            return  # nothing to report on, and no renamed files to ask about
         ticket = self._sort_waiting[uid] = self._sort_waiting.get(uid, 0) + 1
         self._spawn(self._sort_when_idle(uid, ticket))
 
@@ -1007,9 +1107,12 @@ class App:
         if self._sort_waiting.get(uid) != ticket:
             return  # a later call took over
         del self._sort_waiting[uid]
+        if self._queue_busy(uid):
+            return  # more files came in: the job that finishes last reports and asks
+        await self._report_batch(uid)  # (the report comes first, then the question about sorting)
         for key in [k for k in self.sort_batches if k[0] == uid]:
             if self._queue_busy(uid):
-                return  # more files came in: the job that finishes last asks
+                return  # more files came in while the report went out: the job that finishes last asks
             await self._sort_ask(key)
 
     async def _sort_ask(self, key: Tuple[int, int]) -> None:
@@ -1038,26 +1141,38 @@ class App:
         batch.prompt_id = sent.id
 
     async def _cb_sort(self, event: Any, uid: int, parts: List[str]) -> None:
-        """The buttons under the question: so:<y|n|m>:<chat the files are in>:<number of the question>."""
+        """The buttons under the questions: so:<y|n|m>:<chat the files are in>:<number of the question> for "sort these now?", and
+        so:<ty|tn>:... for the one that follows a Yes when text messages were sent among the files: put them in the sort as well?"""
         try:
             action, chat, token = parts[1], int(parts[2]), int(parts[3])
         except (IndexError, ValueError):
             await event.answer()
             return
         batch = self.sort_batches.get((uid, chat))
-        if batch is None or batch.prompt_id is None or batch.token != token or action not in ("y", "n", "m"):
+        if batch is None or batch.prompt_id is None or batch.token != token or action not in ("y", "n", "m", "ty", "tn"):
+            await event.answer("That question is over.", alert=True)
+            return
+        if (action in ("ty", "tn")) != bool(batch.texts):  # the buttons of the question about the texts are the only ones of the open question
             await event.answer("That question is over.", alert=True)
             return
         count = len(batch.items)
-        if action == "y":
+        if action in ("y", "ty", "tn"):
             if uid in self._sorting:
                 await event.answer("I'm still sorting your last batch. /cancel to stop it.", alert=True)
                 return
+            texts: List[Note] = batch.texts
+            if action == "y":
+                texts = self._texts_for(uid, batch)
+                if texts:  # Yes, sort: but there are text messages among the files, so one more question first
+                    await self._ask_about_texts(event, batch, chat, texts)
+                    return
+            self._texts_done(uid, batch.texts)
             del self.sort_batches[(uid, chat)]
             await event.answer()
             await self._remove_message(event)
-            await self._sort_files(uid, batch.home, chat, batch.items)
+            await self._sort_files(uid, batch.home, chat, batch.items, notes=texts if action == "ty" else [])
         elif action == "n":
+            self._texts_done(uid, self._texts_for(uid, batch))
             del self.sort_batches[(uid, chat)]
             await event.answer()
             await event.edit(panels.sort_declined(count), buttons=None, parse_mode="html")
@@ -1066,6 +1181,19 @@ class App:
             batch.version += 1
             await event.answer()
             await event.edit(panels.sort_waits(count), buttons=None, parse_mode="html")
+
+    async def _ask_about_texts(self, event: Any, batch: SortBatch, chat: int, texts: List[Note]) -> None:
+        """Turn the question just answered with Yes into the one about the text messages (same message, new buttons)."""
+        previous = batch.token, batch.texts
+        self._sort_tickets += 1
+        batch.token, batch.texts = self._sort_tickets, texts
+        text, rows = panels.texts_question(texts, chat, batch.token)
+        try:
+            await event.answer()
+            await event.edit(text, buttons=panels.to_buttons(rows), parse_mode="html")
+        except BaseException:  # noqa: BLE001
+            batch.token, batch.texts = previous  # the first question is still the one on the screen
+            raise
 
     async def cmd_queue(self, event: Any) -> None:
         uid = event.sender_id
@@ -1594,7 +1722,7 @@ class App:
         )
 
     def _speed_text(self) -> str:
-        return sysinfo.format_speed(transfer.stats, self.cfg.stream_transfer)
+        return sysinfo.format_speed(transfer.stats, self.cfg.stream_transfer, getattr(self.client, "flood", None))
 
     async def cmd_stats(self, event: Any) -> None:
         await self._reply(event, await self._stats_text())

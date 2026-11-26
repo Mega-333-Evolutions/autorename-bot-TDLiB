@@ -33,6 +33,14 @@ from bot.parser import (
         ("Plain Name.mkv", "Plain Name", "", "", "", ""),
         ("Show S2 - 07 [1080p].mkv", "Show", "02", "07", "1080p", ""),
         ("Movie 4K HDR.mkv", "Movie", "", "", "2160p", ""),
+        # a dash, dot or space between the letter and its number: season and episode are both found
+        ("Black Clover [Sub] S-02 E-08 [1080p] @Od3ns_Animes.mkv", "Black Clover", "02", "08", "1080p", ""),
+        ("Black.Clover.S-02.E-08.1080p.mkv", "Black Clover", "02", "08", "1080p", ""),
+        ("Black Clover S 2 E 8 720p.mkv", "Black Clover", "02", "08", "720p", ""),
+        ("Show S02 - E08 [720p].mkv", "Show", "02", "08", "720p", ""),
+        ("Show S02.E08.mkv", "Show", "02", "08", "", ""),
+        ("S-02 E-08 Black Clover.mkv", "Black Clover", "02", "08", "", ""),
+        ("Show E-05 [720p].mkv", "Show", "01", "05", "720p", ""),
     ],
 )
 def test_parse_info(name, title, season, episode, quality, year):
@@ -40,6 +48,11 @@ def test_parse_info(name, title, season, episode, quality, year):
     assert (info.title, info.season, info.episode, info.quality, info.year) == (
         title, season, episode, quality, year
     )
+
+
+def test_an_audio_codec_label_with_dashes_is_not_an_episode():
+    for name in ("Show DDP5.1 E-AC-3 1080p.mkv", "Dolby E-AC-3 5.1 Show 1080p.mkv"):
+        assert parse_info(name).episode == ""
 
 
 def test_resolution_is_not_an_episode():

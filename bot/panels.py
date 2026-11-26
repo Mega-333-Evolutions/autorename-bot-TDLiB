@@ -570,7 +570,7 @@ def sequence_status(count: int, limit: int) -> Panel:
     return text, [[("🔢 Sort now", "sq:sort"), ("🗑 Discard", "sq:cx")]]
 
 
-SORT_PREFIX = "so"  # callback data of the question below: so:<y|n|m>:<chat the files are in>:<number of the question>
+SORT_PREFIX = "so"  # callback data of the questions below: so:<y|n|m (sort now?) or ty|tn (the text messages too?)>:<chat the files are in>:<number>
 
 
 def sort_question(count: int, chat: int, token: int, *, elsewhere: bool = False) -> Panel:
@@ -594,6 +594,23 @@ def sort_declined(count: int) -> str:
 
 def sort_waits(count: int) -> str:
     return f"➕ Okay, send me more files. I'll ask again when the queue is empty, about all of them ({count} so far)."
+
+
+def texts_question(texts: Sequence[Any], chat: int, token: int) -> Panel:
+    """What the bot asks after Yes to sorting when the user also sent text messages among the files (``texts`` have a ``text``): put them
+    in the sort as well?  The answer starts the sort either way."""
+    count = len(texts)
+    these = f"{count} text messages" if count != 1 else "a text message"
+    shown = ", ".join("“%s”" % esc(clip(((n.text or "").strip().splitlines() or [""])[0], 30)) for n in texts[:3])
+    more = f" and {count - 3} more" if count > 3 else ""
+    text = (
+        "📝 <b>Do you want to include the non-media messages in the sort as well?</b>\n\n"
+        f"You sent {these} along with the files: {shown}{more}.\n"
+        "✅ Yes: each one is sent again, in the same place between the episodes.\n"
+        "❌ No: only the files are sorted."
+    )
+    data = f"{SORT_PREFIX}:%s:{chat}:{token}"
+    return text, [[("✅ Yes", data % "ty"), ("❌ No", data % "tn")]]
 
 
 # ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import bot.main as bot_main
 from bot import __version__, tdstate
-from bot.config import load_config
+from bot.config import ConfigError, load_config
 from bot.db import Database
 from bot.errorlog import ChannelLogHandler
 from bot.tg import Client
@@ -193,6 +193,37 @@ async def test_what_start_raises_while_logging_in_is_passed_on():
         await bot_main.login(LoginTd("error"))
 
 
+# ---------------------------------------------------------------------------
+# how many files move at the same time
+# ---------------------------------------------------------------------------
+
+REQUIRED = {"API_ID": "11", "API_HASH": "hash", "BOT_TOKEN": "1234:abc", "OWNER_ID": "1"}
+
+
+def test_one_upload_and_two_downloads_at_a_time_unless_the_settings_say_otherwise():
+    cfg = load_config(REQUIRED)
+    assert (cfg.max_uploads, cfg.max_downloads) == (1, 2)
+    cfg = load_config({**REQUIRED, "MAX_UPLOADS": "2", "MAX_DOWNLOADS": "3"})
+    assert (cfg.max_uploads, cfg.max_downloads) == (2, 3)
+
+
+@pytest.mark.parametrize("value, uploads, downloads", [("0", 1, 1), ("-5", 1, 1), ("1", 1, 1), ("4", 4, 4), ("9", 4, 4), (" 3 ", 3, 3), ("", 1, 2)])
+def test_the_limits_are_kept_between_one_and_four(value, uploads, downloads):
+    cfg = load_config({**REQUIRED, "MAX_UPLOADS": value, "MAX_DOWNLOADS": value})
+    assert (cfg.max_uploads, cfg.max_downloads) == (uploads, downloads)  # (empty is not set: each has its own default)
+
+
+@pytest.mark.parametrize("name", ["MAX_UPLOADS", "MAX_DOWNLOADS"])
+def test_a_limit_that_is_not_a_number_is_a_configuration_error(name):
+    with pytest.raises(ConfigError, match=name):
+        load_config({**REQUIRED, name: "many"})
+
+
+def test_the_number_of_jobs_does_not_change_the_number_of_transfers():
+    cfg = load_config({**REQUIRED, "MAX_CONCURRENT_JOBS": "3"})
+    assert (cfg.max_jobs, cfg.max_uploads, cfg.max_downloads) == (3, 1, 2)  # three files are worked on, but one is uploaded at a time
+
+
 @pytest.fixture
 async def boot(tmp_path, monkeypatch):
     """``build_client`` with a fake TDLib: ``plan.hows`` says how each TDLib that is made behaves (``ok`` when the list is used up), and
@@ -229,6 +260,14 @@ async def test_the_first_login_starts_tdlib_and_makes_the_client(boot):
     assert isinstance(client, Client) and td.started and td.state_seen == []  # nothing was saved: TDLib starts empty
     assert client.session.dc_id is None  # not told, so the first file will tell
     assert client.tmp_dir == Path(boot.cfg.temp_dir) / "send"
+
+
+async def test_the_client_gets_one_limiter_built_from_the_settings(boot):
+    client = await bot_main.build_client(boot.cfg, boot.db)
+    assert (client.flood.max_uploads, client.flood.max_downloads) == (1, 2)
+    other = await bot_main.build_client(dataclasses.replace(boot.cfg, max_uploads=3, max_downloads=4), boot.db)
+    assert (other.flood.max_uploads, other.flood.max_downloads) == (3, 4)
+    assert other.flood is not client.flood  # (each start-up makes its own: nothing is shared between two clients)
 
 
 async def test_the_data_center_setting_reaches_the_client(boot):

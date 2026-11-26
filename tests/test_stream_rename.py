@@ -11,6 +11,7 @@ import pytest
 from bot import errorlog, pipeline, transfer
 from bot.config import load_config
 from bot.db import Database
+from bot.flood import FloodControl
 from bot.media import probe
 from bot.pipeline import Renamer, embedded_thumb, make_caption, source_attributes
 from bot.queue import Job
@@ -475,6 +476,100 @@ async def test_a_room_check_keeps_a_stream_off_a_disk_that_is_nearly_full(env, m
     await Renamer(client, env.cfg, env.db).process(job)
     assert client.relays == [] and job.state == "failed"  # streaming is not tried, and the usual way has no room either: it says so
     assert "disk space" in client.edits[-1][0]
+
+
+# ---------------------------------------------------------------------------
+# the places among the transfers, and the check of what was sent
+# ---------------------------------------------------------------------------
+
+
+class SlotClient(FakeClient):
+    """Notes how many of the upload places and of the download places are taken while a file is being sent, and how many sends overlap."""
+
+    def __init__(self, message, source, flood):
+        super().__init__(message, source)
+        self.flood = flood
+        self.taken, self.now, self.peak = [], 0, 0
+
+    async def send_file(self, target, source, **kwargs):
+        self.taken.append((self.flood.uploads.used, self.flood.downloads.used))
+        self.now += 1
+        self.peak = max(self.peak, self.now)
+        try:
+            await asyncio.sleep(0.02)
+            return await super().send_file(target, source, **kwargs)
+        finally:
+            self.now -= 1
+
+
+class ReplyClient(FakeClient):
+    """Answers a send with a message the way TDLib reports it, so there is something to check afterwards: ``kept`` says whether the file
+    has its thumbnail."""
+
+    def __init__(self, message, source, kept):
+        super().__init__(message, source)
+        self.kept = kept
+
+    async def send_file(self, target, source, **kwargs):
+        reply = await super().send_file(target, source, **kwargs)
+        name = next(a.file_name for a in kwargs["attributes"] if isinstance(a, types.DocumentAttributeFilename))
+        size = source.size if isinstance(source, Generated) else Path(source).stat().st_size
+        thumbnail = thumbnail_of(file_id=200) if self.kept else None
+        return Message(td_message(document_content(name, size, file_id=100 + len(self.sent), remote_id="sent", thumbnail=thumbnail),
+                                  chat_id=target, plain_id=reply.id, out=True))
+
+
+def a_job(job_id=1, msg_id=7, new_name=NEW_NAME):
+    return Job(id=job_id, user_id=42, chat_id=42, msg_id=msg_id, file_name=NAME, size=BIG, new_name=new_name, status_msg=SimpleNamespace(id=99))
+
+
+async def test_a_streamed_file_holds_an_upload_place_and_a_download_place_while_it_goes(env):
+    flood = FloodControl(uploads=1, downloads=2)
+    client = SlotClient(FakeMessage(video=video_attr(), thumbs=preview_sizes()), env.media_dir / "sample.mkv", flood)
+    await Renamer(client, env.cfg, env.db).process(job := a_job())
+    assert job.state == "done" and len(client.relays) == 1
+    assert client.taken == [(1, 1)]  # while it streams it is an upload and a download at the same time
+    assert (flood.uploads.used, flood.downloads.used) == (0, 0)  # and both places are free again afterwards
+
+
+async def test_streamed_files_take_turns_when_there_is_only_one_place(env):
+    flood = FloodControl(uploads=1, downloads=1)
+    client = SlotClient(FakeMessage(video=video_attr(), thumbs=preview_sizes()), env.media_dir / "sample.mkv", flood)
+    renamer = Renamer(client, env.cfg, env.db)
+    jobs = [a_job(1, 7), a_job(2, 8, "[S01E06] Tokyo Revengers [1080p].mkv")]
+    await asyncio.wait_for(asyncio.gather(*(renamer.process(job) for job in jobs)), 30)  # (waiting for each other for ever would be a deadlock)
+    assert [job.state for job in jobs] == ["done", "done"] and len(client.sent) == 2
+    assert client.peak == 1 and client.taken == [(1, 1), (1, 1)]
+    assert any("Waiting for a turn" in text for text, _b in client.edits)  # the one that waited said so
+    assert (flood.uploads.used, flood.downloads.used) == (0, 0)
+
+
+@needs_ffmpeg
+async def test_the_places_are_given_back_when_streaming_fails_and_the_usual_way_takes_over(env):
+    flood = FloodControl(uploads=1, downloads=1)
+    client = SlotClient(FakeMessage(video=video_attr(), thumbs=preview_sizes()), env.media_dir / "sample.mkv", flood)
+    client.stream_failure = RuntimeError("DC unreachable")
+    await asyncio.wait_for(Renamer(client, env.cfg, env.db).process(job := a_job()), 30)  # (a place kept would make the download wait for ever)
+    assert job.state == "done" and len(client.downloads) == 1 and len(client.uploads) == 1
+    assert client.taken == [(1, 1), (1, 0)]  # the stream was both; the usual upload is one, as the download was over by then
+    assert (flood.uploads.used, flood.downloads.used) == (0, 0)
+
+
+async def test_a_streamed_file_that_comes_out_without_its_thumbnail_is_not_sent_again_but_says_so(env):
+    client = ReplyClient(FakeMessage(video=video_attr(), thumbs=preview_sizes()), env.media_dir / "sample.mkv", kept=False)
+    await Renamer(client, env.cfg, env.db).process(job := a_job())
+    assert job.state == "done" and len(client.sent) == 1 and len(client.relays) == 1  # a stream cannot be played again: there is no file to send
+    done = client.edits[-1][0]
+    assert "🔍 Checked: size · name\n" in done and "⚠️ Telegram sent the file without its thumbnail." in done
+    assert job.result.warnings == ["Telegram sent the file without its thumbnail."]
+
+
+async def test_a_streamed_file_that_kept_its_thumbnail_says_so(env):
+    client = ReplyClient(FakeMessage(video=video_attr(), thumbs=preview_sizes()), env.media_dir / "sample.mkv", kept=True)
+    await Renamer(client, env.cfg, env.db).process(job := a_job())
+    assert job.state == "done" and len(client.sent) == 1
+    done = client.edits[-1][0]
+    assert "🔍 Checked: size · name · thumbnail" in done and "⚠️" not in done and job.result.warnings == []
 
 
 # ---------------------------------------------------------------------------

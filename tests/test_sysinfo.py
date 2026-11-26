@@ -1,6 +1,7 @@
 import pytest
 
 from bot import sysinfo, transfer
+from bot.flood import FloodControl
 
 
 def test_parse_cpu_max():
@@ -174,3 +175,19 @@ def test_the_speed_summary_and_section_say_whether_streaming_is_on(monkeypatch):
     text = sysinfo.format_speed(stats, False)
     assert "⚠️ Streaming failed 1× and those files were saved first and then uploaded. Last: <code>ValueError: &lt;x&gt;</code>" in text
     assert "Streaming failed" in sysinfo.format_speed(stats)  # said whether or not streaming is on now
+
+
+def test_the_speed_section_says_what_holds_the_transfers_back(monkeypatch):
+    monkeypatch.setattr(sysinfo, "loop_backend", lambda: "uvloop")
+    stats = transfer.TransferStats(downloads=3, uploads=2)
+    assert "Telegram's limits" not in sysinfo.format_speed(stats) and "🌊" not in sysinfo.format_speed(stats, True)  # no limiter: nothing to say
+
+    flood = FloodControl(uploads=1, downloads=2)
+    text = sysinfo.format_speed(stats, None, flood)
+    assert "🌊 <b>Telegram's limits:</b> 0/1 uploads · 0/2 downloads · no flood · 0 flood waits since the start" in text
+    assert text.index("<b>Downloads:</b>") < text.index("Telegram's limits")  # it comes right after the counts of the transfers
+
+    flood.hit(12.0, transfer=True)
+    text = sysinfo.format_speed(stats, False, flood)
+    assert "holding back for " in text and "s · 1 flood wait since the start" in text and "⚠️" not in text  # a flood is told, not a failure of the bot
+    assert text.index("Telegram's limits") < text.index("Streamed renames")  # and the line about the streamed renames stays after it

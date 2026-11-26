@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import mimetypes
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from . import datacenter, errorlog, media, transfer
 from .config import Config
@@ -31,6 +32,29 @@ MIME_OVERRIDES = {
 }
 # containers worth running ffprobe on
 PROBE_EXTS = media.VIDEO_CONTAINERS | media.AUDIO_TAG_EXTS | {".avi", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp", ".wav", ".aac", ".wma"}
+
+RETRIES = 2  # how often a file that failed only because Telegram was busy is tried again
+RETRY_PAUSE = (60.0, 180.0)  # seconds before the first new try, and before the second
+THUMB_STRIKES = 3  # files in a row that still have no thumbnail after being sent again: then Telegram is not asked again for a while ...
+THUMB_PAUSE = 600.0  # ... this many seconds (such files are still reported)
+
+
+def has_thumbnail(message: Any) -> bool:
+    """Did Telegram keep a preview picture with the file?  One that never got to Telegram (it is still a file on the bot's disk) does not count."""
+    remote = (getattr(message, "thumb_file", None) or {}).get("remote") or {}
+    return bool(remote.get("id") or remote.get("is_uploading_completed"))
+
+
+@dataclass
+class Result:
+    """How a job went, for the report on a batch of files.  ``Job.result`` holds one while the job runs."""
+
+    state: str = "running"  # running | done | failed | cancelled
+    reason: str = ""  # why it failed
+    warnings: List[str] = field(default_factory=list)
+    checks: str = ""  # what was looked at once the file was in its chat ("size · name · tracks · thumbnail")
+    retries: int = 0  # how often it was tried again because Telegram was busy
+    thumb_resent: bool = False  # it went out without its thumbnail and was sent again
 
 
 def guess_mime(name: str, fallback: Optional[str]) -> str:
@@ -115,6 +139,10 @@ class Renamer:
         self.on_delivered: Optional[Callable[[Job, int, Any], Awaitable[None]]] = None
         # the same for a file renamed with the auto settings (it joins the files the bot asks about sorting, see app)
         self.on_renamed: Optional[Callable[[Job, int, Any], Awaitable[None]]] = None
+        # told how every job ended once it will not be tried again (``await on_result(job, job.result)``): what the report on a batch is made of
+        self.on_result: Optional[Callable[[Job, Result], Awaitable[None]]] = None
+        self._thumb_strikes = 0  # files in a row that still had no thumbnail after being sent again
+        self._thumb_pause = 0.0  # until then (``time.monotonic()``) a file without its thumbnail is reported and not sent again
 
     # ------------------------------------------------------------------
     async def _fresh_message(self, job: Job) -> Any:
@@ -155,19 +183,71 @@ class Renamer:
         context = errorlog.error_context.set(  # the log channel report says which file this was
             f"user {job.user_id} · job #{job.id}\n{job.file_name} → {job.new_name} ({human_size(job.size)})"
         )
+        job.result = Result(retries=job.attempts)
         try:
             await self._run(job, s, work, reporter, started)
         except Cancelled:
-            job.state = "cancelled"
+            job.state = job.result.state = "cancelled"
             await reporter.finish("❌ <b>Cancelled</b>\n<code>" + esc(clip(job.new_name, 120)) + "</code>")
         except Exception as exc:  # noqa: BLE001
-            job.state = "failed"
+            if errors.is_busy(exc) and self._give_back(job, exc, reporter):
+                await reporter.flush()  # (the message that says so is shown before the worker goes on to another job)
+                return
+            job.state = job.result.state = "failed"
             log.exception("Error processing file:")
-            reason = clip(f"{type(exc).__name__}: {exc}", 300)
-            await reporter.finish(f"❌ <b>Failed</b>\n<code>{esc(clip(job.new_name, 120))}</code>\n\n{esc(reason)}")
+            reason = job.result.reason = clip(f"{type(exc).__name__}: {exc}", 300)
+            tries = f"\nTried {job.attempts + 1} times." if job.attempts else ""
+            await reporter.finish(f"❌ <b>Failed</b>\n<code>{esc(clip(job.new_name, 120))}</code>\n\n{esc(reason)}{tries}")
         finally:
             errorlog.error_context.reset(context)
             shutil.rmtree(work, ignore_errors=True)
+        await self._tell_result(job)
+
+    def _give_back(self, job: Job, exc: BaseException, reporter: ProgressReporter) -> bool:
+        """A file that failed only because Telegram was busy goes back in the queue to be tried again after a pause (what was
+        downloaded is kept by TDLib).  ``False`` when it has been tried enough, or the user cancelled it."""
+        if job.attempts >= RETRIES or job.cancel.is_set():
+            return False
+        pause = RETRY_PAUSE[min(job.attempts, len(RETRY_PAUSE) - 1)]
+        job.attempts += 1
+        job.retry_at = time.time() + pause
+        job.state = "queued"
+        log.warning("%s failed because Telegram was busy (%s: %s): trying again in %.0fs (try %d of %d)",
+                    job.new_name, type(exc).__name__, exc, pause, job.attempts + 1, RETRIES + 1)
+        reporter.waiting("🔁 Telegram was busy", f"Trying again in {human_duration(pause)} (try {job.attempts + 1} of {RETRIES + 1}).")
+        return True
+
+    async def _tell_result(self, job: Job) -> None:
+        if self.on_result is None or job.result is None:
+            return
+        try:
+            await self.on_result(job, job.result)
+        except Exception:  # noqa: BLE001 - the job is over whatever happens here
+            log.exception("could not note how the file ended")
+
+    @staticmethod
+    def _result_of(job: Job) -> Result:
+        """The job's record of how it went (made here for a job that was not started by ``process``)."""
+        if job.result is None:
+            job.result = Result(retries=job.attempts)
+        return job.result
+
+    @contextlib.asynccontextmanager
+    async def _turn(self, job: Job, reporter: ProgressReporter, kind: str) -> AsyncIterator[None]:
+        """A place among the downloads or the uploads, once any flood is over, held for as long as the transfer lasts.  Only so many
+        transfers run at once, however many jobs there are: that is what keeps Telegram from asking the bot to slow down."""
+        flood = getattr(self.client, "flood", None)
+        if flood is None:
+            yield
+            return
+        download = kind == "download"
+        if flood.cooling:
+            reporter.waiting("⏳ Telegram asked the bot to slow down", "Starting again in a moment.")
+        elif (flood.downloads if download else flood.uploads).crowded:
+            reporter.waiting("⏳ Waiting for a turn", f"Other files are being {'downloaded' if download else 'uploaded'}: "
+                                                       "this one starts when there is a free place.")
+        async with (flood.download if download else flood.upload)(job.cancel):
+            yield
 
     async def _custom_thumb(self, job: Job) -> Optional[bytes]:
         """The thumbnail the user chose: the one of the format being used (``None``: a frame of the video is used)."""
@@ -232,17 +312,20 @@ class Renamer:
         plan = await self._stream_plan(job, s, msg, ext, send_type, size)
         if plan is None:
             return False
-        reporter.set_stage("⬇️⬆️ Streaming", size, dc=self._dc_note(msg, upload=True))
-        began = time.monotonic()
         caption = make_caption(s["caption"], new_name=job.new_name, orig_name=orig_name, ext=ext, size=size, duration=plan.duration)
         warnings = list(job.notes)
         relay = transfer.Relay(self.client, msg, job.new_name, cancel=job.cancel)
+        began = time.monotonic()
         try:
-            async with relay:
-                target, sent = await self._send(
-                    job, s, msg, relay.source, caption=caption, attrs=plan.attrs, as_document=plan.as_document, thumb=plan.thumb,
-                    warnings=warnings, reporter=reporter, cancel=relay.cancel,
-                )
+            # (the upload's place first: nobody holds an upload's place while waiting for a download's, so this cannot block for ever)
+            async with self._turn(job, reporter, "upload"), self._turn(job, reporter, "download"):
+                reporter.set_stage("⬇️⬆️ Streaming", size, dc=self._dc_note(msg, upload=True))
+                began = time.monotonic()
+                async with relay:
+                    target, sent = await self._send(
+                        job, s, msg, relay.source, caption=caption, attrs=plan.attrs, as_document=plan.as_document, thumb=plan.thumb,
+                        warnings=warnings, reporter=reporter, cancel=relay.cancel, resend=False,  # (the file is not kept: nothing to send again)
+                    )
         except Exception as exc:  # noqa: BLE001
             if job.cancel.is_set():
                 raise Cancelled() from exc
@@ -253,7 +336,8 @@ class Renamer:
         seconds = time.monotonic() - began
         rates = f" · ⬇⬆ {human_size(size / seconds)}/s streamed" if seconds >= 1 else ""
         transfer.stats.streamed += 1
-        await self._finish(job, target, sent, final_size=size, warnings=warnings, rates=rates, started=started, reporter=reporter)
+        checks = self._checked(job, sent, size, "", plan.thumb is not None, warnings)
+        await self._finish(job, target, sent, final_size=size, warnings=warnings, rates=rates, started=started, reporter=reporter, checks=checks)
         return True
 
     def _stream_failed(self, job: Job, exc: BaseException) -> None:
@@ -264,10 +348,11 @@ class Renamer:
     async def _send(
         self, job: Job, s: Dict[str, Any], msg: Any, source: Any, *, caption: Optional[str], attrs: List[Any],
         as_document: bool, thumb: Optional[bytes], warnings: List[str], reporter: ProgressReporter,
-        cancel: Optional[asyncio.Event] = None,
+        cancel: Optional[asyncio.Event] = None, resend: bool = True,
     ) -> Tuple[int, Any]:
         """Upload ``source`` (a path, or a file being relayed) to the chat it goes to; ``(that chat, the message that was sent)``.
-        ``reporter`` hears of the upload, and ``cancel`` (``job.cancel`` unless another event is given) stops it."""
+        ``reporter`` hears of the upload, and ``cancel`` (``job.cancel`` unless another event is given) stops it.  ``resend``: the file
+        can be sent again (it is not a stream) if it goes out without the thumbnail it was given."""
         target = s.get("target_channel") or job.chat_id
         kwargs: Dict[str, Any] = dict(
             caption=caption, attributes=attrs, mime_type=guess_mime(job.new_name, getattr(msg.file, "mime_type", None)),
@@ -284,20 +369,88 @@ class Renamer:
             sent = await self.client.send_file(target, source, **kwargs)
             warnings.append("The caption was rejected by Telegram (check your caption template), so it was left out.")
         transfer.stats.uploads += 1
+        if thumb is not None:
+            sent = await self._keep_thumbnail(job, target, sent, source, kwargs, warnings, reporter, resend)
         return target, sent
+
+    async def _keep_thumbnail(
+        self, job: Job, target: int, sent: Any, source: Any, kwargs: Dict[str, Any], warnings: List[str], reporter: ProgressReporter,
+        resend: bool,
+    ) -> Any:
+        """Did Telegram keep the thumbnail the file was sent with?  Not always: when the thumbnail itself fails to upload (while Telegram
+        is busy, say) the file goes out without it and nothing says so.  Such a file is sent again once, and the first copy is deleted
+        once the second is there; one that is still without a thumbnail stays, with a warning.  The message that stays is returned."""
+        if not getattr(sent, "content_type", "") or has_thumbnail(sent):  # (not a message Telegram described: nothing to look at)
+            self._thumb_strikes = 0
+            return sent
+        if not resend or time.monotonic() < self._thumb_pause:
+            warnings.append("Telegram sent the file without its thumbnail.")
+            return sent
+        log.warning("%s went out without its thumbnail: sending it again", job.new_name)
+        reporter.set_stage("⬆️ Uploading again (its thumbnail was lost)", int(getattr(getattr(sent, "file", None), "size", 0) or 0))
+        try:
+            again = await self.client.send_file(target, source, **kwargs)
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the first copy is still there
+            log.warning("%s: sending it again failed: %s: %s", job.new_name, type(exc).__name__, exc)
+            warnings.append(f"Telegram sent the file without its thumbnail, and sending it again failed ({type(exc).__name__}).")
+            return sent
+        transfer.stats.uploads += 1
+        self._result_of(job).thumb_resent = True
+        try:
+            await self.client.delete_messages(target, [sent.id])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s: could not delete the copy without a thumbnail: %s", job.new_name, exc)
+            warnings.append("The first copy, which has no thumbnail, could not be deleted.")
+        if getattr(again, "content_type", "") and not has_thumbnail(again):
+            warnings.append("Telegram left the thumbnail out again.")
+            self._thumb_strikes += 1
+            if self._thumb_strikes >= THUMB_STRIKES:
+                self._thumb_pause = time.monotonic() + THUMB_PAUSE
+                log.error("%d files in a row had no thumbnail even when sent again: not sending them again for %.0f minutes",
+                          self._thumb_strikes, THUMB_PAUSE / 60)
+        else:
+            self._thumb_strikes = 0
+        return again
+
+    def _checked(self, job: Job, sent: Any, final_size: int, tracks: str, thumb_sent: bool, warnings: List[str]) -> str:
+        """What was looked at once the file was in its chat, for the done message: ``size · name · tracks (…) · thumbnail``.  Whatever
+        does not match is a warning instead.  A message that says nothing about its file (not one Telegram described) is not looked at."""
+        done: List[str] = []
+        file = getattr(sent, "file", None) if getattr(sent, "content_type", "") else None
+        if file is not None:
+            if file.size:
+                if file.size == final_size:
+                    done.append("size")
+                else:
+                    warnings.append(f"Telegram has {human_size(file.size)} and the file sent was {human_size(final_size)}.")
+            if file.name:
+                if file.name == job.new_name:
+                    done.append("name")
+                else:
+                    warnings.append(f"Telegram calls the file “{file.name}”, not “{job.new_name}”.")
+        if tracks:
+            done.append(f"tracks ({tracks})")
+        if thumb_sent and file is not None and has_thumbnail(sent):
+            done.append("thumbnail")
+        return " · ".join(done)
 
     async def _finish(
         self, job: Job, target: int, sent: Any, *, final_size: int, warnings: List[str], rates: str, started: float,
-        reporter: ProgressReporter,
+        reporter: ProgressReporter, checks: str = "",
     ) -> None:
         """Count a file that was sent and say it is done."""
         await self.db.record_job(job.user_id, final_size)
         job.state = "done"
+        result = self._result_of(job)
+        result.state, result.warnings, result.checks = "done", list(warnings), checks
         took = time.monotonic() - started
         note = "".join(f"\n⚠️ {esc(w)}" for w in warnings)
         where = "" if target == job.chat_id else "\n📣 Sent to your channel."
+        verified = f"\n🔍 Checked: {esc(checks)}" if checks else ""
         await reporter.finish(
-            f"✅ <b>Done</b> in {human_duration(took)}\n<code>{esc(clip(job.new_name, 120))}</code>\n{human_size(final_size)}{rates}{where}{note}"
+            f"✅ <b>Done</b> in {human_duration(took)}\n<code>{esc(clip(job.new_name, 120))}</code>\n{human_size(final_size)}{rates}{verified}{where}{note}"
         )
         await self._after_delivery(job, target, sent)
 
@@ -327,9 +480,10 @@ class Renamer:
         self._check_space(work, size, will_remux=bool(s["metadata_on"]))
 
         # ---- download ------------------------------------------------------------
-        reporter.set_stage("⬇️ Downloading", size, dc=self._dc_note(msg))
-        began = time.monotonic()
-        await client.download_to(msg, src, progress=reporter, cancel=job.cancel)
+        async with self._turn(job, reporter, "download"):
+            reporter.set_stage("⬇️ Downloading", size, dc=self._dc_note(msg))
+            began = time.monotonic()
+            await client.download_to(msg, src, progress=reporter, cancel=job.cancel)
         transfer.stats.downloads += 1
         down_seconds = time.monotonic() - began
         if job.cancel.is_set():
@@ -347,14 +501,28 @@ class Renamer:
         plan = media.build_plan(info, s, ext) if (info is not None and s["metadata_on"]) else None
         if s["metadata_on"] and plan is None and info is not None and ext.lower() not in (media.VIDEO_CONTAINERS | media.AUDIO_TAG_EXTS):
             warnings.append(f"Metadata is not supported for {ext or 'this file type'}, so it was skipped.")
+        tracks = ""  # what the new file holds, for the line that says what was checked
         if plan is not None:
             warnings.extend(plan.warnings)
             reporter.set_stage("⚙️ Applying metadata & tracks", 0)
             out = work / f"out{ext}"
-            await media.apply_plan(src, out, plan, job.cancel)
-            src.unlink(missing_ok=True)
-            current = out
-            info = await media.probe(current, job.cancel)
+            problems: List[str] = []
+            notes: List[str] = []
+            try:
+                await media.apply_plan(src, out, plan, job.cancel)
+                made = await media.probe(out, job.cancel)
+                problems, notes = media.check_remux(info, plan, made, out.stat().st_size)
+            except MediaError as exc:
+                problems = [str(exc)]
+            if problems:  # a file that is not what was asked for is not sent: the original goes out as it is, and the user is told
+                out.unlink(missing_ok=True)
+                log.error("%s: ffmpeg's file was not used: %s", job.new_name, "; ".join(problems))
+                warnings.append("The metadata and track changes could not be made (" + "; ".join(problems) + "), so the file went out as it was.")
+            else:
+                src.unlink(missing_ok=True)
+                current, info = out, made
+                warnings.extend(notes)
+                tracks = media.count_tracks(info)
 
         final_size = current.stat().st_size
 
@@ -385,6 +553,8 @@ class Renamer:
             thumb_path = work / "thumb.jpg"
             if await media.make_video_thumbnail(current, thumb_path, info.duration, job.cancel):
                 thumb = thumb_path.read_bytes()
+            else:
+                warnings.append("No thumbnail could be made from the video, so it went out without one.")
 
         # ---- caption ---------------------------------------------------------------------
         caption = make_caption(
@@ -393,16 +563,18 @@ class Renamer:
         )
 
         # ---- upload ---------------------------------------------------------------------------
-        reporter.set_stage("⬆️ Uploading", final_size)
-        began = time.monotonic()
-        target, sent = await self._send(
-            job, s, msg, current, caption=caption, attrs=attrs, as_document=(send_type == "document"), thumb=thumb,
-            warnings=warnings, reporter=reporter,
-        )
-        up_seconds = time.monotonic() - began
+        async with self._turn(job, reporter, "upload"):
+            reporter.set_stage("⬆️ Uploading", final_size)
+            began = time.monotonic()
+            target, sent = await self._send(
+                job, s, msg, current, caption=caption, attrs=attrs, as_document=(send_type == "document"), thumb=thumb,
+                warnings=warnings, reporter=reporter,
+            )
+            up_seconds = time.monotonic() - began
+        checks = self._checked(job, sent, final_size, tracks, thumb is not None, warnings)
         rates = "".join(  # how fast each way went; a transfer under a second says nothing
             f" · {arrow} {human_size(amount / seconds)}/s"
             for arrow, amount, seconds in (("⬇", size, down_seconds), ("⬆", final_size, up_seconds))
             if seconds >= 1 and amount > 0
         )
-        await self._finish(job, target, sent, final_size=final_size, warnings=warnings, rates=rates, started=started, reporter=reporter)
+        await self._finish(job, target, sent, final_size=final_size, warnings=warnings, rates=rates, started=started, reporter=reporter, checks=checks)
